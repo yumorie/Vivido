@@ -10,4 +10,5 @@ uv run --no-cache "{project-root}/_bmad/scripts/render_skill.py" --project-root 
 ```
 
 - On success, read and follow the one absolute `workflow.md` instruction printed to stdout.
-- On failure (including `uv` being unavailable), report the command output and HALT. Do not run any workflow source directly.
+- On failure, report the command output. If this repository is a Node/Expo project (a root `package.json` declares the working toolchain), `uv` is unavailable, and `AGENTS.md` explicitly says that `uv` is not a project requirement, continue with the repository's Node/Expo contract instead of treating the helper failure as a build blocker. Do not install Python tooling or infer a Python environment.
+- For all other failures, HALT. Do not run workflow source directly.
