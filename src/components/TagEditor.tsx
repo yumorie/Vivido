@@ -9,7 +9,9 @@ import {
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { Tag } from '../types';
-import { getAllTags, createTag, deleteTag } from '../services/database';
+import { getAllTagsWithUsage, createTag, deleteTag } from '../services/database';
+import { rankTagSuggestions } from '../utils/tagSearch';
+import type { TagSuggestion } from '../utils/tagSearch';
 
 interface TagEditorProps {
   selectedTags: Tag[];
@@ -20,7 +22,7 @@ export const TagEditor: React.FC<TagEditorProps> = ({
   selectedTags,
   onTagsChange,
 }) => {
-  const [allTags, setAllTags] = useState<Tag[]>([]);
+  const [allTags, setAllTags] = useState<TagSuggestion[]>([]);
   const [showInput, setShowInput] = useState(false);
   const [newTagName, setNewTagName] = useState('');
 
@@ -33,7 +35,7 @@ export const TagEditor: React.FC<TagEditorProps> = ({
 
   const loadAllTags = async () => {
     try {
-      const tags = await getAllTags();
+      const tags = await getAllTagsWithUsage();
       setAllTags(tags);
     } catch (error) {
       console.error('Failed to load tags:', error);
@@ -61,8 +63,9 @@ export const TagEditor: React.FC<TagEditorProps> = ({
         handleAddTag(existing);
       } else {
         const newTag = await createTag(name);
-        setAllTags([...allTags, newTag]);
-        handleAddTag(newTag);
+        const suggestion = { ...newTag, usageCount: 0, lastUsedAt: null };
+        setAllTags([...allTags, suggestion]);
+        handleAddTag(suggestion);
       }
       setNewTagName('');
       setShowInput(false);
@@ -90,7 +93,7 @@ export const TagEditor: React.FC<TagEditorProps> = ({
     }
   };
 
-  const unselectedTags = allTags.filter(
+  const unselectedTags = rankTagSuggestions(allTags, newTagName).filter(
     (tag) => !selectedTags.some((t) => t.id === tag.id)
   );
 

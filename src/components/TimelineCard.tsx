@@ -1,9 +1,11 @@
 import React, { useRef } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Dimensions, Animated } from 'react-native';
 import { Image } from 'expo-image';
-import { MediaItem } from '../types';
+import { MediaItem, Tag } from '../types';
 import { getOrderedMedia } from '../utils/media';
 import { VideoPoster } from './VideoPoster';
+import { extractPlainText } from '../editor';
+import { TagPills } from './TagPills';
 
 interface TimelineCardProps {
   diary: {
@@ -11,6 +13,7 @@ interface TimelineCardProps {
     title: string;
     content: string;
     media: MediaItem[];
+    tags: Tag[];
     createdAt: number;
   };
   onPress: () => void;
@@ -116,6 +119,7 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({ diary, onPress }) =>
   const scaleAnim = useRef(new Animated.Value(1)).current;
 
   const orderedMedia = getOrderedMedia(diary.media);
+  const plainContent = extractPlainText(diary.content);
   const images = orderedMedia.filter((m) => m.type === 'image');
   const videos = orderedMedia.filter((m) => m.type === 'video');
   const audios = orderedMedia.filter((m) => m.type === 'audio');
@@ -124,7 +128,7 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({ diary, onPress }) =>
   const totalMedia = orderedMedia.length;
 
   const previewContent =
-    diary.content.length > 60 ? diary.content.slice(0, 60) + '...' : diary.content;
+    plainContent.length > 60 ? plainContent.slice(0, 60) + '...' : plainContent;
 
   const handlePressIn = () => {
     Animated.spring(scaleAnim, {
@@ -207,6 +211,7 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({ diary, onPress }) =>
                 <Text style={styles.audioTagText}>♪ 语音 {audios.length}</Text>
               </View>
             )}
+            <TagPills tags={diary.tags} />
           </View>
 
           {/* Media count badge */}

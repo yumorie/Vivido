@@ -2,6 +2,7 @@ import React from 'react';
 import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { Image } from 'expo-image';
 import { DiaryEntry } from '../types';
+import { extractPlainText } from '../editor';
 
 interface DiaryCardProps {
   diary: DiaryEntry;
@@ -24,7 +25,8 @@ const formatWeekDay = (timestamp: number): string => {
 export const DiaryCard: React.FC<DiaryCardProps> = ({ diary, onPress }) => {
   const { day, month } = formatMonthDay(diary.createdAt);
   const weekDay = formatWeekDay(diary.createdAt);
-  const previewContent = diary.content.slice(0, 80) + (diary.content.length > 80 ? '...' : '');
+  const plainContent = extractPlainText(diary.content);
+  const previewContent = plainContent.slice(0, 80) + (plainContent.length > 80 ? '...' : '');
   const hasMedia = diary.media.length > 0;
 
   return (

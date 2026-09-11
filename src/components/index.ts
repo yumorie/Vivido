@@ -10,5 +10,6 @@ export { TagChip } from './TagChip';
 export { WordCloud } from './WordCloud';
 export { EmptyDiscovery } from './EmptyDiscovery';
 export { TagEditor } from './TagEditor';
+export { TagPills } from './TagPills';
 export { AudioRecorder } from './AudioRecorder';
 export { AudioPlayer } from './AudioPlayer';

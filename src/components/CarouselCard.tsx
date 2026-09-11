@@ -5,6 +5,8 @@ import { MediaItem, Tag } from '../types';
 import { getOrderedMedia } from '../utils/media';
 import { VideoPoster } from './VideoPoster';
 import { colors, typography, alpha } from '../theme';
+import { extractPlainText } from '../editor';
+import { TagPills } from './TagPills';
 
 interface CarouselCardProps {
   diary: {
@@ -37,10 +39,9 @@ export const CarouselCard: React.FC<CarouselCardProps> = ({ diary, width, onPres
   const cover = orderedMedia[0];
   const isVideoCover = cover?.type === 'video';
   const isAudioCover = cover?.type === 'audio';
+  const plainContent = extractPlainText(diary.content ?? '');
   // 安全取内容预览：content 可能为 null，先回退为空字符串
   // 无媒体时取正文第一行（按换行符截取），不限字数
-  const contentPreview = (diary.content ?? '').split('\n')[0] || '无内容';
-
   return (
     <View style={[styles.wrapper, { width }]}>
       <TouchableOpacity style={styles.card} onPress={onPress} activeOpacity={0.92}>
@@ -64,7 +65,7 @@ export const CarouselCard: React.FC<CarouselCardProps> = ({ diary, width, onPres
           ) : (
             <View style={styles.mediaPlaceholder}>
               <Text style={styles.placeholderText}>
-                {contentPreview}
+                {plainContent.split('\n')[0] || '无内容'}
               </Text>
             </View>
           )}
@@ -80,22 +81,13 @@ export const CarouselCard: React.FC<CarouselCardProps> = ({ diary, width, onPres
           <Text style={styles.title} numberOfLines={2}>
             {diary.title || '无标题'}
           </Text>
-          {diary.content ? (
+          {plainContent ? (
             <Text style={styles.preview} numberOfLines={cover ? 2 : 5}>
-              {diary.content}
+              {plainContent}
             </Text>
           ) : null}
 
-          {diary.tags.length > 0 && (
-            <View style={styles.tagRow}>
-              {diary.tags.slice(0, 4).map((tag) => (
-                <View key={tag.id} style={styles.tagPill}>
-                  <View style={[styles.tagDot, { backgroundColor: tag.color }]} />
-                  <Text style={styles.tagText}>{tag.name}</Text>
-                </View>
-              ))}
-            </View>
-          )}
+          <TagPills tags={diary.tags} />
         </View>
       </TouchableOpacity>
     </View>
@@ -193,30 +185,5 @@ const styles = StyleSheet.create({
     fontSize: 15,
     color: colors.textSecondary,
     lineHeight: 24,
-  },
-  tagRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 14,
-  },
-  tagPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 999,
-    backgroundColor: alpha(colors.primary, 0.08),
-  },
-  tagDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
-  },
-  tagText: {
-    ...typography.body,
-    fontSize: 12,
-    color: colors.textSecondary,
   },
 });

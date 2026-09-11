@@ -183,6 +183,16 @@ Vivido uses three custom fonts for a distinctive visual identity:
 
 ## Development Notes
 
+### Block Editor development commands
+
+- `npm.cmd run test:editor` runs the focused codec, media-lifecycle, and tag-ranking tests.
+- `npx.cmd tsc --noEmit` checks the TypeScript project.
+- `npm.cmd run editor:build:vivido` is only needed after changing `src/editor/integration/web/**` or its build tooling. It generates the checked-in WebView source from the custom editor source.
+- The editor uses TenTap 1.0.1 with `react-native-webview` 13.16.0, one editor and one WebView. A development client must be rebuilt after adding or changing native dependencies.
+- Runtime HTML/JSON is transient; SQLite `content TEXT` remains the sole persisted body-content source. The editor build uses `@tiptap/*` and Vite only as build-time devDependencies.
+
+The current code and static checks are complete, but final Android device smoke testing remains required for editor ready/retry, keyboard/caret behavior, media atom ordering and deletion, picker permissions, reading/gallery rendering, tag visuals, and mount/unmount behavior.
+
 - TypeScript strict mode is enabled — run `npx tsc --noEmit` to check for type errors
 - The `postinstall` script runs `patch-package` — manual `node_modules` fixes should be persisted via `npx patch-package <package-name>`
 - Android `TextInput` components can exhibit internal scrolling behavior; use `scrollEnabled={false}` and `numberOfLines={1}` for single-line inputs

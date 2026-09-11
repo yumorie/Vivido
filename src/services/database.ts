@@ -3,6 +3,8 @@ import { DiaryEntry, MediaItem, Tag, TimeFilter, MonthFilter } from '../types';
 import { getDateRangeForKey } from '../utils/date';
 import { generateId } from '../utils/uuid';
 import { accumulateWordFrequency, type WordCount } from '../utils/wordcloud';
+import { extractPlainText } from '../editor/codec/VividoMarkupCodec';
+import type { TagSuggestion } from '../utils/tagSearch';
 
 const DB_NAME = 'diary.db';
 export const SCHEMA_VERSION = 3;
@@ -239,6 +241,21 @@ export const getAllTags = async (): Promise<Tag[]> => {
   if (!db) throw new Error('Database not initialized');
 
   return db.getAllAsync<TagRow>('SELECT * FROM tags ORDER BY name ASC');
+};
+
+export const getAllTagsWithUsage = async (): Promise<TagSuggestion[]> => {
+  if (!db) throw new Error('Database not initialized');
+
+  return db.getAllAsync<TagSuggestion>(
+    `SELECT t.id, t.name, t.color, t.createdAt,
+            COUNT(dt.diaryId) AS usageCount,
+            MAX(d.updatedAt) AS lastUsedAt
+     FROM tags t
+     LEFT JOIN diary_tags dt ON t.id = dt.tagId
+     LEFT JOIN diaries d ON d.id = dt.diaryId
+     GROUP BY t.id
+     ORDER BY t.name ASC`,
+  );
 };
 
 export const deleteTag = async (id: string): Promise<void> => {
@@ -484,12 +501,6 @@ const buildDiscoveryWhereClause = (
   let whereSql = ' WHERE 1=1';
   const params: (string | number)[] = [];
 
-  if (query.trim()) {
-    whereSql += ' AND (title LIKE ? OR content LIKE ?)';
-    const searchTerm = `%${query.trim()}%`;
-    params.push(searchTerm, searchTerm);
-  }
-
   if (!options?.disableDateFilter && selectedDate) {
     const range = getDateRangeForKey(selectedDate);
     if (range) {
@@ -543,9 +554,15 @@ export const searchDiaries = async (
     selectedDate,
     monthFilter
   );
-  const diaries = await db.getAllAsync<DiaryRow>(
+  const diaryRows = await db.getAllAsync<DiaryRow>(
     `SELECT * FROM diaries${whereSql} ORDER BY createdAt DESC`,
     params
+  );
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const diaries = diaryRows.filter((diary) =>
+    !normalizedQuery ||
+    diary.title.toLocaleLowerCase().includes(normalizedQuery) ||
+    extractPlainText(diary.content).toLocaleLowerCase().includes(normalizedQuery)
   );
 
   const diaryIds = diaries.map((d) => d.id);
@@ -604,16 +621,24 @@ export const getWordFrequency = async (
   whereSql += ' AND createdAt >= ?';
   params.push(startDate.getTime());
 
-  const diaries = await db.getAllAsync<{ content: string }>(
-    `SELECT content FROM diaries${whereSql}`,
+  const diaries = await db.getAllAsync<{ title: string; content: string }>(
+    `SELECT title, content FROM diaries${whereSql}`,
     params
   );
+  const normalizedQuery = query.trim().toLocaleLowerCase();
 
   // 分词/词频启发式收敛在 utils/wordcloud（零依赖、无 AI），不外溢到组件
   const wordCount = new Map<string, WordCount>();
 
   for (const diary of diaries) {
-    accumulateWordFrequency(diary.content, wordCount);
+    if (
+      normalizedQuery &&
+      !diary.title.toLocaleLowerCase().includes(normalizedQuery) &&
+      !extractPlainText(diary.content).toLocaleLowerCase().includes(normalizedQuery)
+    ) {
+      continue;
+    }
+    accumulateWordFrequency(extractPlainText(diary.content), wordCount);
   }
 
   return wordCount;
@@ -814,6 +839,41 @@ export const deleteDraft = async (id: string): Promise<void> => {
   if (!db) throw new Error('Database not initialized');
 
   await db.runAsync('DELETE FROM drafts WHERE id = ?', [id]);
+};
+
+/**
+ * Conservative post-commit reference check for staged media cleanup.
+ * It covers the media table, persisted markup in diaries/drafts, and the
+ * legacy media JSON stored on drafts without changing the schema.
+ */
+export const isMediaReferenced = async (media: Pick<MediaItem, 'id' | 'uri'>): Promise<boolean> => {
+  if (!db) throw new Error('Database not initialized');
+
+  const mediaRow = await db.getFirstAsync<{ id: string }>(
+    'SELECT id FROM media WHERE id = ? OR uri = ? LIMIT 1',
+    [media.id, media.uri],
+  );
+  if (mediaRow) return true;
+
+  const markupNeedle = `media://${media.id}`;
+  const diaryMarkup = await db.getFirstAsync<{ id: string }>(
+    'SELECT id FROM diaries WHERE instr(content, ?) > 0 LIMIT 1',
+    [markupNeedle],
+  );
+  if (diaryMarkup) return true;
+
+  const drafts = await db.getAllAsync<{ content: string; media: string }>(
+    'SELECT content, media FROM drafts',
+  );
+  return drafts.some((draft) => {
+    if (draft.content.includes(`media://${media.id}`)) return true;
+    try {
+      const draftMedia = JSON.parse(draft.media) as Array<{ id?: string; uri?: string }>;
+      return draftMedia.some((item) => item.id === media.id || item.uri === media.uri);
+    } catch {
+      return false;
+    }
+  });
 };
 
 export const getAllDrafts = async (): Promise<Draft[]> => {

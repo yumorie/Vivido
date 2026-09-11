@@ -18,6 +18,7 @@ import { FilterChips } from '../components/FilterChips';
 import { TagChip } from '../components/TagChip';
 import { WordCloud } from '../components/WordCloud';
 import { EmptyDiscovery } from '../components/EmptyDiscovery';
+import { extractPlainText } from '../editor';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Discovery'>;
 
@@ -254,7 +255,9 @@ export const DiscoveryScreen: React.FC = () => {
             <EmptyDiscovery type={hasActiveFilters ? 'filter' : 'general'} />
           ) : (
             <View style={styles.diaryList}>
-              {diaries.map((diary) => (
+              {diaries.map((diary) => {
+                const plainContent = extractPlainText(diary.content);
+                return (
                 <TouchableOpacity
                   key={diary.id}
                   style={styles.diaryItem}
@@ -268,7 +271,7 @@ export const DiscoveryScreen: React.FC = () => {
                     {new Date(diary.createdAt).toLocaleDateString('zh-CN')}
                   </Text>
                   <Text style={styles.diaryPreview} numberOfLines={2}>
-                    {diary.content}
+                    {plainContent}
                   </Text>
                   {diary.tags.length > 0 && (
                     <View style={styles.diaryTags}>
@@ -281,7 +284,8 @@ export const DiscoveryScreen: React.FC = () => {
                     </View>
                   )}
                 </TouchableOpacity>
-              ))}
+                );
+              })}
             </View>
           )}
         </View>

@@ -15,8 +15,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import { DatePickerModal } from '../components/DatePickerModal';
 import { RootStackParamList, DiaryEntry, MediaItem, Tag } from '../types';
-import { getDiaryById, createDiary, updateDiary, saveDraft, getDraft, deleteDraft, Draft } from '../services/database';
-import { saveMedia, deleteMedia, deleteDiaryMedia, MEDIA_DIR_PATH } from '../services/storage';
+import { getDiaryById, createDiary, updateDiary, saveDraft, getDraft, deleteDraft, isMediaReferenced, Draft } from '../services/database';
+import { saveMedia, deleteMedia, MEDIA_DIR_PATH } from '../services/storage';
 import { generateId } from '../utils/uuid';
 import { MediaPicker } from '../components/MediaPicker';
 import { TagEditor } from '../components/TagEditor';
@@ -24,6 +24,8 @@ import { AudioRecorder } from '../components/AudioRecorder';
 import { StyledDialog } from '../components/StyledDialog';
 import { assignMediaPositions, getMediaFileExtension, getOrderedMedia } from '../utils/media';
 import { formatDateInputValue, getWeekDayLabel, parseDateInputValue } from '../utils/date';
+import { collectMediaIds, extractPlainText, RichEditorAdapter, RichEditorHost } from '../editor';
+import { selectPostCommitCleanupCandidates } from '../editor/mediaLifecycle';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Editor'>;
 type EditorRouteProp = RouteProp<RootStackParamList, 'Editor'>;
@@ -48,6 +50,11 @@ export const EditorScreen: React.FC = () => {
   const [media, setMedia] = useState<MediaItem[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
   const [loading, setLoading] = useState(false);
+  const [editorReady, setEditorReady] = useState(false);
+  const [editorLoadError, setEditorLoadError] = useState<string | null>(null);
+  const [editorMountKey, setEditorMountKey] = useState(0);
+  const [entryLoaded, setEntryLoaded] = useState(!isEditing);
+  const [contentLength, setContentLength] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [originalMedia, setOriginalMedia] = useState<MediaItem[]>([]);
   const [initialCreatedAt, setInitialCreatedAt] = useState(Date.now());
@@ -81,27 +88,57 @@ export const EditorScreen: React.FC = () => {
 
   // Draft data for restore dialog
   const [draftData, setDraftData] = useState<Draft | null>(null);
+  const editorRef = useRef<RichEditorAdapter | null>(null);
+  const editorDirtyRef = useRef(false);
+  const autoSaveDraftRef = useRef<() => Promise<void>>(async () => undefined);
+  const autoSaveInFlightRef = useRef<Promise<void> | null>(null);
+  const autoSavePendingRef = useRef(false);
+  const manualSaveRef = useRef(false);
+  const editorMediaIdsRef = useRef<Set<string>>(new Set());
+  const stagedMediaRef = useRef<MediaItem[]>([]);
 
   useEffect(() => {
     if (isEditing && diaryId) {
+      setEntryLoaded(false);
+      setEditorReady(false);
+      setEditorLoadError(null);
       loadDiary(diaryId);
     } else {
+      setEntryLoaded(true);
+      setEditorLoadError(null);
       checkDraft();
     }
   }, [diaryId]);
 
+  useEffect(() => {
+    if (!entryLoaded || editorReady || editorLoadError) return;
+
+    const timeout = setTimeout(() => {
+      setEditorLoadError('编辑器加载超时，请重试');
+    }, 9000);
+
+    return () => clearTimeout(timeout);
+  }, [entryLoaded, editorReady, editorLoadError, editorMountKey]);
+
+  const retryEditor = () => {
+    editorRef.current = null;
+    setEditorReady(false);
+    setEditorLoadError(null);
+    setEditorMountKey((current) => current + 1);
+  };
+
   // Auto-save draft with debounce
   useEffect(() => {
-    if (isSaving) return;
+    if (isSaving || !editorReady || manualSaveRef.current) return;
 
     if (draftSaveTimer.current) {
       clearTimeout(draftSaveTimer.current);
     }
 
-    const hasContent = !!(title.trim() || content.trim() || media.length > 0);
+    const hasContent = !!(title.trim() || content.trim() || media.length > 0) || editorDirtyRef.current;
     if (hasContent) {
       draftSaveTimer.current = setTimeout(() => {
-        autoSaveDraft();
+        void autoSaveDraftRef.current();
       }, 2000);
     }
 
@@ -110,7 +147,7 @@ export const EditorScreen: React.FC = () => {
         clearTimeout(draftSaveTimer.current);
       }
     };
-  }, [title, content, date, media, tags]);
+  }, [title, content, date, media, tags, editorReady]);
 
   // Track unsaved changes
   useEffect(() => {
@@ -120,10 +157,11 @@ export const EditorScreen: React.FC = () => {
         content !== initialContent ||
         date !== initialDate ||
         JSON.stringify(media) !== JSON.stringify(originalMedia) ||
-        JSON.stringify(tags) !== JSON.stringify(initialTags);
+        JSON.stringify(tags) !== JSON.stringify(initialTags) ||
+        editorDirtyRef.current;
       setHasUnsavedChanges(hasChanges);
     } else {
-      const hasContent = !!(title.trim() || content.trim() || media.length > 0);
+      const hasContent = !!(title.trim() || content.trim() || media.length > 0) || editorDirtyRef.current;
       setHasUnsavedChanges(hasContent);
     }
   }, [title, content, date, media, tags, originalMedia, initialTitle, initialContent, initialDate, initialTags, isEditing]);
@@ -174,42 +212,96 @@ export const EditorScreen: React.FC = () => {
     }
   };
 
-  const autoSaveDraft = async () => {
-    try {
-      const draftId = getDraftId(diaryId);
-
-      const hasChanges = isEditing
-        ? title !== initialTitle ||
-          content !== initialContent ||
-          date !== initialDate ||
-          JSON.stringify(media) !== JSON.stringify(originalMedia) ||
-          JSON.stringify(tags) !== JSON.stringify(initialTags)
-        : !!(title.trim() || content.trim() || media.length > 0);
-
-      if (!hasChanges) return;
-
-      await saveDraft({
-        id: draftId,
-        diaryId: diaryId || null,
-        title,
-        content,
-        date,
-        media,
-        tags,
-        updatedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error('Failed to auto-save draft:', error);
+  const clearDraftSaveSchedule = () => {
+    if (draftSaveTimer.current) {
+      clearTimeout(draftSaveTimer.current);
+      draftSaveTimer.current = null;
     }
+    autoSavePendingRef.current = false;
+  };
+
+  const getPersistedMedia = (markup: string, candidates: MediaItem[]): MediaItem[] => {
+    const referencedIds = collectMediaIds(markup);
+    return candidates.filter(
+      (item) => !editorMediaIdsRef.current.has(item.id) || referencedIds.has(item.id),
+    );
+  };
+
+  const autoSaveDraft = async () => {
+    if (manualSaveRef.current) return;
+    if (autoSaveInFlightRef.current) {
+      autoSavePendingRef.current = true;
+      return;
+    }
+    const task = (async () => {
+      try {
+        const draftId = getDraftId(diaryId);
+        const editorMarkup = editorRef.current ? await editorRef.current.getMarkup() : content;
+        const persistedMedia = getPersistedMedia(editorMarkup, media);
+        setContentLength(extractPlainText(editorMarkup).length);
+
+        const hasChanges = isEditing
+          ? title !== initialTitle ||
+            editorDirtyRef.current ||
+            editorMarkup !== initialContent ||
+            date !== initialDate ||
+            JSON.stringify(persistedMedia) !== JSON.stringify(originalMedia) ||
+            JSON.stringify(tags) !== JSON.stringify(initialTags)
+          : !!(title.trim() || editorMarkup.trim() || persistedMedia.length > 0);
+
+        if (!hasChanges) return;
+
+        await saveDraft({
+          id: draftId,
+          diaryId: diaryId || null,
+          title,
+          content: editorMarkup,
+          date,
+          media: persistedMedia,
+          tags,
+          updatedAt: Date.now(),
+        });
+      } catch (error) {
+        console.error('Failed to auto-save draft:', error);
+      }
+    })();
+    autoSaveInFlightRef.current = task;
+    try {
+      await task;
+    } finally {
+      autoSaveInFlightRef.current = null;
+      if (autoSavePendingRef.current && !manualSaveRef.current) {
+        autoSavePendingRef.current = false;
+        scheduleEditorDraftSave();
+      } else if (manualSaveRef.current) {
+        autoSavePendingRef.current = false;
+      }
+    }
+  };
+  autoSaveDraftRef.current = autoSaveDraft;
+
+  const scheduleEditorDraftSave = () => {
+    if (isSaving || manualSaveRef.current) return;
+    if (draftSaveTimer.current) clearTimeout(draftSaveTimer.current);
+    draftSaveTimer.current = setTimeout(() => {
+      void autoSaveDraftRef.current();
+    }, 2000);
   };
 
   const restoreDraft = () => {
     if (!draftData) return;
+    if (draftData.content !== content) {
+    setEditorReady(false);
+    editorMediaIdsRef.current = collectMediaIds(draftData.content);
+    }
     setTitle(draftData.title);
     setContent(draftData.content);
+    setContentLength(extractPlainText(draftData.content).length);
     setDate(draftData.date);
     setMedia(draftData.media);
     setTags(draftData.tags);
+    editorDirtyRef.current = true;
+    setHasUnsavedChanges(true);
     setDraftDialogVisible(false);
   };
 
@@ -227,8 +319,10 @@ export const EditorScreen: React.FC = () => {
     try {
       const diary = await getDiaryById(id);
       if (diary) {
+        editorDirtyRef.current = false;
         setTitle(diary.title);
         setContent(diary.content);
+        setContentLength(extractPlainText(diary.content).length);
         setDate(formatDateInputValue(diary.createdAt));
         setInitialCreatedAt(diary.createdAt);
         const orderedMedia = assignMediaPositions(getOrderedMedia(diary.media));
@@ -239,6 +333,8 @@ export const EditorScreen: React.FC = () => {
         setInitialContent(diary.content);
         setInitialDate(formatDateInputValue(diary.createdAt));
         setInitialTags(diary.tags);
+        editorMediaIdsRef.current = collectMediaIds(diary.content);
+        setEntryLoaded(true);
 
         await checkDraft({
           title: diary.title,
@@ -256,7 +352,7 @@ export const EditorScreen: React.FC = () => {
     }
   };
 
-  const pickImage = async () => {
+  const pickMedia = async (mediaType: 'image' | 'video') => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
       setLibraryPermissionDialogVisible(true);
@@ -265,53 +361,84 @@ export const EditorScreen: React.FC = () => {
 
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ['images', 'videos'],
+        mediaTypes: mediaType === 'image' ? ['images'] : ['videos'],
         allowsMultipleSelection: true,
         orderedSelection: true,
         quality: 1,
       });
 
       if (!result.canceled) {
-        const newMedia: MediaItem[] = result.assets.map((asset) => ({
-          id: generateId(),
-          type: asset.type === 'video' ? 'video' : 'image',
-          uri: asset.uri,
-          fileName: asset.fileName,
-          mimeType: asset.mimeType,
-        }));
-        setMedia(assignMediaPositions([...media, ...newMedia]));
+        for (const asset of result.assets) {
+          try {
+            const id = generateId();
+            const item: MediaItem = {
+              id,
+              type: mediaType,
+              uri: asset.uri,
+              fileName: asset.fileName,
+              mimeType: asset.mimeType,
+            };
+            const savedUri = await saveMedia(asset.uri, `${id}.${getMediaFileExtension(item)}`);
+            const savedItem = { ...item, uri: savedUri };
+            stagedMediaRef.current.push(savedItem);
+            setMedia((current) => assignMediaPositions([...current, savedItem]));
+            if (editorReady && editorRef.current) {
+              editorMediaIdsRef.current.add(item.id);
+              if (item.type === 'video') editorRef.current.insertVideo(item.id);
+              else editorRef.current.insertImage(item.id);
+            }
+          } catch (error) {
+            console.warn(`Failed to stage ${mediaType}:`, error);
+          }
+        }
       }
     } catch (error) {
-      console.error('Failed to pick image:', error);
+      console.error(`Failed to pick ${mediaType}:`, error);
     }
   };
 
-  const handleAudioRecorded = (uri: string) => {
-    const newAudio: MediaItem = {
-      id: generateId(),
-      type: 'audio',
-      uri,
-      mimeType: 'audio/mp4',
-    };
-    setMedia(assignMediaPositions([...media, newAudio]));
+  const pickImage = () => pickMedia('image');
+  const pickVideo = () => pickMedia('video');
+
+  const handleAudioRecorded = async (uri: string) => {
+    try {
+      const id = generateId();
+      const newAudio: MediaItem = {
+        id,
+        type: 'audio',
+        uri,
+        mimeType: 'audio/mp4',
+      };
+      const savedUri = await saveMedia(uri, `${id}.m4a`);
+      const savedAudio = { ...newAudio, uri: savedUri };
+      stagedMediaRef.current.push(savedAudio);
+      setMedia((current) => assignMediaPositions([...current, savedAudio]));
+      if (editorReady && editorRef.current) {
+        editorMediaIdsRef.current.add(savedAudio.id);
+        editorRef.current.insertAudio(savedAudio.id);
+      }
+    } catch (error) {
+      console.error('Failed to stage recorded audio:', error);
+    }
   };
 
   const handleSave = async (skipNavigation?: boolean) => {
-    if (!title.trim() && !content.trim() && media.length === 0) {
-      setEmptyContentDialogVisible(true);
-      return false;
-    }
+    if (!editorReady || manualSaveRef.current) return false;
+    manualSaveRef.current = true;
+    clearDraftSaveSchedule();
 
-    // Clear draft auto-save timer to prevent race after manual save
-    if (draftSaveTimer.current) {
-      clearTimeout(draftSaveTimer.current);
-      draftSaveTimer.current = null;
-    }
-
-    setLoading(true);
-    setIsSaving(true);
-    const newlySavedUris: string[] = [];
+    let editorMarkup = content;
+    let saveSucceeded = false;
     try {
+      editorMarkup = editorRef.current ? await editorRef.current.getMarkup() : content;
+      const persistedMedia = getPersistedMedia(editorMarkup, media);
+      if (!title.trim() && !editorMarkup.trim() && persistedMedia.length === 0) {
+        setEmptyContentDialogVisible(true);
+        return false;
+      }
+
+      setLoading(true);
+      setIsSaving(true);
       const parsedCreatedAt = parseDateInputValue(
         date,
         isEditing ? initialCreatedAt : Date.now()
@@ -325,7 +452,10 @@ export const EditorScreen: React.FC = () => {
       }
 
       const savedMedia: MediaItem[] = [];
-      for (const item of assignMediaPositions(media)) {
+      const removedMedia = isEditing
+        ? originalMedia.filter((om) => !persistedMedia.some((sm) => sm.id === om.id))
+        : [];
+      for (const item of assignMediaPositions(persistedMedia)) {
         const isInOurStorage = item.uri.startsWith(MEDIA_DIR_PATH);
         const isOriginal = originalMedia.some((m) => m.id === item.id);
 
@@ -336,8 +466,8 @@ export const EditorScreen: React.FC = () => {
         } else {
           const fileName = `${generateId()}.${getMediaFileExtension(item)}`;
           const savedUri = await saveMedia(item.uri, fileName);
-          savedMedia.push({ ...item, uri: savedUri });
-          newlySavedUris.push(savedUri);
+          const savedItem = { ...item, uri: savedUri };
+          savedMedia.push(savedItem);
         }
       }
 
@@ -345,7 +475,7 @@ export const EditorScreen: React.FC = () => {
       const entry: DiaryEntry = {
         id: diaryId || generateId(),
         title: title.trim(),
-        content: content.trim(),
+        content: editorMarkup.trim(),
         media: savedMedia,
         tags: tags,
         createdAt: parsedCreatedAt,
@@ -353,49 +483,77 @@ export const EditorScreen: React.FC = () => {
       };
 
       if (isEditing) {
-        const removedMedia = originalMedia.filter(
-          (om) => !savedMedia.some((sm) => sm.id === om.id)
-        );
         await updateDiary(entry);
-        await deleteDiaryMedia(removedMedia);
       } else {
         await createDiary(entry);
       }
 
       // Delete draft after successful save
       const draftId = getDraftId(diaryId);
+      if (autoSaveInFlightRef.current) {
+        await autoSaveInFlightRef.current;
+      }
+      clearDraftSaveSchedule();
       await deleteDraft(draftId);
+      saveSucceeded = true;
+
+      const cleanupCandidates = selectPostCommitCleanupCandidates(
+        [...removedMedia, ...stagedMediaRef.current],
+        persistedMedia,
+      );
+      for (const item of cleanupCandidates) {
+        try {
+          if (!(await isMediaReferenced(item))) {
+            await deleteMedia(item.uri);
+            if (item.thumbnail) await deleteMedia(item.thumbnail);
+          }
+        } catch (error) {
+          console.warn('Failed to post-commit media cleanup:', error);
+        }
+      }
 
       setHasUnsavedChanges(false);
       setIsSaving(false);
       if (isEditing) {
         setInitialTitle(title.trim());
-        setInitialContent(content.trim());
+        setInitialContent(editorMarkup.trim());
         setInitialDate(date);
         setInitialTags(tags);
         setOriginalMedia(savedMedia);
         setInitialCreatedAt(parsedCreatedAt);
       }
 
+      editorDirtyRef.current = false;
+      editorMediaIdsRef.current = collectMediaIds(editorMarkup);
+      setMedia(savedMedia);
+      setContentLength(extractPlainText(editorMarkup).length);
+      setContent(editorMarkup);
+
       if (!skipNavigation) {
         navigation.goBack();
       }
+      stagedMediaRef.current = [];
       return true;
     } catch (error) {
       console.error('Failed to save diary:', error);
-      // Clean up newly saved media files on failure to prevent orphans
-      for (const uri of newlySavedUris) {
-        try {
-          await deleteMedia(uri);
-        } catch {
-          // Ignore cleanup errors
-        }
-      }
       setSaveErrorDialogVisible(true);
       return false;
     } finally {
+      const shouldResumeDraft = !saveSucceeded && (
+        editorDirtyRef.current ||
+        title !== initialTitle ||
+        content !== initialContent ||
+        date !== initialDate ||
+        JSON.stringify(media) !== JSON.stringify(originalMedia) ||
+        JSON.stringify(tags) !== JSON.stringify(initialTags)
+      );
+      clearDraftSaveSchedule();
+      manualSaveRef.current = false;
       setLoading(false);
       setIsSaving(false);
+      if (shouldResumeDraft) {
+        scheduleEditorDraftSave();
+      }
     }
   };
 
@@ -430,10 +588,10 @@ export const EditorScreen: React.FC = () => {
             <TouchableOpacity
               style={[styles.headerButton, styles.saveButton]}
               onPress={() => handleSave()}
-              disabled={loading}
+              disabled={loading || !editorReady}
             >
-              <Text style={[styles.saveText, loading && styles.disabledText]}>
-                {loading ? '保存中...' : '保存'}
+              <Text style={[styles.saveText, (loading || !editorReady) && styles.disabledText]}>
+                {loading ? '保存中...' : editorReady ? '保存' : '编辑器加载中...'}
               </Text>
             </TouchableOpacity>
           </View>
@@ -454,7 +612,7 @@ export const EditorScreen: React.FC = () => {
                   {date} {getWeekDayLabel(date)}
                 </Text>
               </TouchableOpacity>
-              <Text style={styles.charCount}>{content.length} 字</Text>
+              <Text style={styles.charCount}>{contentLength} 字</Text>
             </View>
 
             {/* Title & Content area */}
@@ -474,36 +632,76 @@ export const EditorScreen: React.FC = () => {
                 numberOfLines={1}
               />
               <View style={styles.divider} />
-              <TextInput
-                style={styles.contentInput}
-                placeholder="写下今天的故事..."
-                placeholderTextColor="#c4b8ae"
-                value={content}
-                onChangeText={setContent}
-                multiline
-                textAlignVertical="top"
-                scrollEnabled={false}
-                autoCorrect={false}
-                autoCapitalize="none"
-                autoFocus={!isEditing}
-              />
+              {entryLoaded && !editorLoadError ? (
+                <RichEditorHost
+                  key={editorMountKey}
+                  ref={editorRef}
+                  initialMarkup={content}
+                  onReady={(adapter) => {
+                    editorRef.current = adapter;
+                    setEditorLoadError(null);
+                    setEditorReady(true);
+                  }}
+                  onDirty={() => {
+                    if (!editorDirtyRef.current) {
+                      editorDirtyRef.current = true;
+                      setHasUnsavedChanges(true);
+                    }
+                    scheduleEditorDraftSave();
+                  }}
+                />
+              ) : editorLoadError ? (
+                <View style={styles.editorLoading}>
+                  <Text style={styles.editorLoadingText}>{editorLoadError}</Text>
+                  <TouchableOpacity style={styles.editorRetryButton} onPress={retryEditor}>
+                    <Text style={styles.editorRetryText}>重试</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <View style={styles.editorLoading}>
+                  <Text style={styles.editorLoadingText}>编辑器加载中...</Text>
+                </View>
+              )}
             </View>
 
             {/* Media section */}
             <View style={styles.mediaSection}>
               <View style={styles.mediaButtonRow}>
-                <TouchableOpacity onPress={pickImage} activeOpacity={0.7} style={styles.mediaButtonFlex}>
-                  <Text style={styles.mediaLabel}>添加媒体</Text>
+                <TouchableOpacity
+                  onPress={pickImage}
+                  activeOpacity={0.7}
+                  style={[styles.mediaButtonFlex, !editorReady && styles.mediaButtonDisabled]}
+                  disabled={!editorReady}
+                  accessibilityState={{ disabled: !editorReady }}
+                >
+                  <Text style={styles.mediaLabel}>图片</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={pickVideo}
+                  activeOpacity={0.7}
+                  style={[styles.mediaButtonFlex, !editorReady && styles.mediaButtonDisabled]}
+                  disabled={!editorReady}
+                  accessibilityState={{ disabled: !editorReady }}
+                >
+                  <Text style={styles.mediaLabel}>视频</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   onPress={() => setShowAudioRecorder(true)}
                   activeOpacity={0.7}
-                  style={styles.mediaButtonFlex}
+                  style={[styles.mediaButtonFlex, !editorReady && styles.mediaButtonDisabled]}
+                  disabled={!editorReady}
+                  accessibilityState={{ disabled: !editorReady }}
                 >
                   <Text style={styles.mediaLabel}>录音</Text>
                 </TouchableOpacity>
               </View>
-              <MediaPicker media={media} onMediaChange={setMedia} />
+              <MediaPicker
+                media={media.filter((item) => !editorMediaIdsRef.current.has(item.id))}
+                onMediaChange={(nextMedia) => {
+                  const bodyMedia = media.filter((item) => editorMediaIdsRef.current.has(item.id));
+                  setMedia(assignMediaPositions([...bodyMedia, ...nextMedia]));
+                }}
+              />
             </View>
 
             <TagEditor
@@ -591,7 +789,7 @@ export const EditorScreen: React.FC = () => {
       <StyledDialog
         visible={libraryPermissionDialogVisible}
         title="权限不足"
-        message="需要访问相册权限才能选择图片"
+        message="需要访问相册权限才能选择图片或视频"
         buttons={[{ text: '确定', style: 'default', onPress: () => setLibraryPermissionDialogVisible(false) }]}
         onDismiss={() => setLibraryPermissionDialogVisible(false)}
       />
@@ -753,6 +951,30 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(196, 112, 48, 0.15)',
     marginVertical: 12,
   },
+  editorLoading: {
+    minHeight: 220,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  editorLoadingText: {
+    fontSize: 15,
+    color: TEXT_MUTED,
+    fontFamily: 'LXGWWenKaiLite',
+  },
+  editorRetryButton: {
+    marginTop: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: 'rgba(196, 112, 48, 0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(196, 112, 48, 0.2)',
+  },
+  editorRetryText: {
+    fontSize: 14,
+    color: BRAND_GOLD,
+    fontFamily: 'LXGWWenKaiLite',
+  },
   contentInput: {
     fontSize: 17,
     color: TEXT_PRIMARY,
@@ -775,6 +997,9 @@ const styles = StyleSheet.create({
   },
   mediaButtonFlex: {
     flex: 1,
+  },
+  mediaButtonDisabled: {
+    opacity: 0.45,
   },
   mediaLabel: {
     fontSize: 14,

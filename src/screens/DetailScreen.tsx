@@ -14,16 +14,17 @@ import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Image } from 'expo-image';
 import { RootStackParamList, DiaryEntry, MediaItem } from '../types';
-import { getDiaryById, deleteDiary, getAdjacentDiaryIds } from '../services/database';
-import { deleteDiaryMedia } from '../services/storage';
+import { getDiaryById, deleteDiary, getAdjacentDiaryIds, isMediaReferenced } from '../services/database';
+import { deleteMedia } from '../services/storage';
 import { FullScreenGallery } from '../components/FullScreenGallery';
 import { StyledDialog } from '../components/StyledDialog';
 import { getOrderedMedia } from '../utils/media';
 import { VideoPoster } from '../components/VideoPoster';
-import { DiaryContent } from '../components/DiaryContent';
+import { VividoMarkupContent } from '../components/VividoMarkupContent';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { usePreference } from '../hooks/usePreference';
 import { PREF_KEYS } from '../services/preferences';
+import { collectMediaIds, extractPlainText } from '../editor';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Detail'>;
 type DetailRouteProp = RouteProp<RootStackParamList, 'Detail'>;
@@ -138,7 +139,12 @@ export const DetailScreen: React.FC = () => {
     try {
       if (diary) {
         await deleteDiary(diaryId);
-        await deleteDiaryMedia(diary.media);
+        for (const item of diary.media) {
+          if (!(await isMediaReferenced(item))) {
+            await deleteMedia(item.uri);
+            if (item.thumbnail) await deleteMedia(item.thumbnail);
+          }
+        }
       }
       navigation.goBack();
     } catch (error) {
@@ -150,6 +156,11 @@ export const DetailScreen: React.FC = () => {
   const openGallery = (index: number) => {
     setGalleryIndex(index);
     setGalleryVisible(true);
+  };
+
+  const openGalleryForMedia = (mediaId: string) => {
+    const index = allVisualMedia.findIndex((media) => media.id === mediaId);
+    if (index >= 0) openGallery(index);
   };
 
   const onViewableItemsChanged = useRef(({ viewableItems }: any) => {
@@ -182,8 +193,11 @@ export const DetailScreen: React.FC = () => {
   }
 
   const allMedia = getOrderedMedia(diary.media);
-  const visualMedia = allMedia.filter((m) => m.type !== 'audio');
-  const audioMedia = allMedia.filter((m) => m.type === 'audio');
+  const markupMediaIds = collectMediaIds(diary.content);
+  const legacyMedia = allMedia.filter((m) => !markupMediaIds.has(m.id));
+  const visualMedia = legacyMedia.filter((m) => m.type !== 'audio');
+  const allVisualMedia = allMedia.filter((m) => m.type !== 'audio');
+  const audioMedia = legacyMedia.filter((m) => m.type === 'audio');
   const hasMedia = visualMedia.length > 0;
 
   const renderMediaItem = ({ item, index }: { item: MediaItem; index: number }) => {
@@ -191,7 +205,7 @@ export const DetailScreen: React.FC = () => {
       return (
         <TouchableOpacity
           style={styles.mediaItem}
-          onPress={() => openGallery(index)}
+          onPress={() => openGalleryForMedia(item.id)}
           activeOpacity={0.95}
         >
           <VideoPoster
@@ -207,7 +221,7 @@ export const DetailScreen: React.FC = () => {
     return (
       <TouchableOpacity
         style={styles.mediaItem}
-        onPress={() => openGallery(index)}
+        onPress={() => openGalleryForMedia(item.id)}
         activeOpacity={0.95}
       >
         <Image
@@ -308,8 +322,15 @@ export const DetailScreen: React.FC = () => {
                 {/* Content */}
                 {diary.content ? (
                   <View style={styles.contentSection}>
-                    <DiaryContent content={diary.content} />
-                    <Text style={styles.charCount}>{diary.content.length} 字</Text>
+                    <VividoMarkupContent
+                      markup={diary.content}
+                      media={allMedia}
+                      onPressMedia={(item) => {
+                        const index = allVisualMedia.findIndex((media) => media.id === item.id);
+                        if (index >= 0) openGallery(index);
+                      }}
+                    />
+                    <Text style={styles.charCount}>{extractPlainText(diary.content).length} 字</Text>
                   </View>
                 ) : null}
 
@@ -329,7 +350,7 @@ export const DetailScreen: React.FC = () => {
                 <Text style={styles.quickDate}>{formatDateFull(diary.createdAt)}</Text>
                 {diary.title ? <Text style={styles.quickTitle}>{diary.title}</Text> : null}
                 {diary.content ? (
-                  <Text style={styles.quickContent}>{diary.content}</Text>
+                  <VividoMarkupContent markup={diary.content} media={allMedia} />
                 ) : null}
               </>
             )}
@@ -379,7 +400,7 @@ export const DetailScreen: React.FC = () => {
       </SafeAreaView>
 
       <FullScreenGallery
-        media={visualMedia}
+        media={allVisualMedia}
         initialIndex={galleryIndex}
         visible={galleryVisible}
         onClose={() => setGalleryVisible(false)}
