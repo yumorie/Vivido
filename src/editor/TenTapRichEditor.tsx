@@ -26,15 +26,25 @@ export interface RichEditorHostProps {
   onReady?: (adapter: RichEditorAdapter) => void;
   onDirty?: () => void;
   onStateChange?: (state: Readonly<RichEditorActiveState>) => void;
+  onFocusChange?: (focused: boolean) => void;
   showToolbar?: boolean;
 }
 
 export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>(
-  function RichEditorHost({ initialMarkup, onReady, onDirty, onStateChange, showToolbar = true }, ref) {
+  function RichEditorHost({
+    initialMarkup,
+    onReady,
+    onDirty,
+    onStateChange,
+    onFocusChange,
+    showToolbar = true,
+  }, ref) {
     const onDirtyRef = useRef(onDirty);
     onDirtyRef.current = onDirty;
     const onStateChangeRef = useRef(onStateChange);
     onStateChangeRef.current = onStateChange;
+    const onFocusChangeRef = useRef(onFocusChange);
+    onFocusChangeRef.current = onFocusChange;
     const controlledLoadGenerationRef = useRef<number | null>(null);
     const onChange = useCallback(() => {
       if (controlledLoadGenerationRef.current !== null) {
@@ -63,6 +73,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
       customSource: VIVIDO_MEDIA_EDITOR_SOURCE,
       onChange,
       theme: editorTheme,
+      dynamicHeight: true,
     });
     const editorState = useBridgeState(editor);
     const editorStateRef = useRef(editorState);
@@ -191,12 +202,21 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
       ),
       [],
     );
+    const handleEditorInteraction = useCallback(() => {
+      onFocusChangeRef.current?.(true);
+    }, []);
 
     return (
       <View style={styles.host}>
         <View style={styles.editorFrame}>
           {/* RichText stays mounted for the complete editor session. */}
-          <RichText editor={editor} style={styles.richText} />
+          <RichText
+            editor={editor}
+            style={styles.richText}
+            allowFileAccess
+            onTouchStart={handleEditorInteraction}
+            onFocus={handleEditorInteraction}
+          />
         </View>
         {showToolbar && <View style={styles.toolbar}>
           {button('B', () => adapter.toggleBold(), Boolean(editorState.isBoldActive))}
@@ -256,11 +276,11 @@ export const RichEditorToolbar: React.FC<RichEditorToolbarProps> = ({ adapter, s
 const styles = StyleSheet.create({
   host: { width: '100%' },
   editorFrame: {
-    minHeight: 220,
+    minHeight: 120,
     backgroundColor: VIVIDO_EDITOR_PAPER_BG,
     overflow: 'hidden',
   },
-  richText: { minHeight: 220, flex: 1, backgroundColor: VIVIDO_EDITOR_PAPER_BG },
+  richText: { minHeight: 120, flex: 1, backgroundColor: VIVIDO_EDITOR_PAPER_BG },
   toolbar: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingTop: 10 },
   button: {
     backgroundColor: alpha(colors.primary, 0.08),

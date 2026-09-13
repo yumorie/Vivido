@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Image } from 'expo-image';
 import { Text, StyleSheet, TouchableOpacity, View } from 'react-native';
 import type { MediaItem } from '../types';
@@ -24,6 +24,40 @@ const VividoMediaPlaceholder = ({ block }: { block: VividoMediaBlock }) => (
     <Text style={styles.missingMediaText}>媒体暂不可用</Text>
   </View>
 );
+
+const VisualMedia = ({ item }: { item: MediaItem }) => {
+  const [aspectRatio, setAspectRatio] = useState(item.type === 'video' ? 16 / 9 : 4 / 3);
+  const updateAspectRatio = (next: number) => {
+    if (Number.isFinite(next) && next > 0 && Math.abs(next - aspectRatio) > 0.01) {
+      setAspectRatio(next);
+    }
+  };
+
+  if (item.type === 'image') {
+    return (
+      <Image
+        source={{ uri: item.uri }}
+        style={[styles.image, { aspectRatio }]}
+        contentFit="contain"
+        onLoad={(event) => {
+          const { width, height } = event.source;
+          if (width > 0 && height > 0) updateAspectRatio(width / height);
+        }}
+      />
+    );
+  }
+
+  return (
+    <VideoPoster
+      thumbnailUri={item.thumbnail}
+      videoUri={item.uri}
+      style={[styles.video, { aspectRatio }]}
+      label="视频"
+      enableGeneratedThumbnail={!item.thumbnail}
+      onAspectRatioChange={updateAspectRatio}
+    />
+  );
+};
 
 export const VividoMarkupContent: React.FC<Props> = ({ markup, media, onPressMedia }) => {
   const blocks = useMemo(() => parseMarkupDocument(markup), [markup]);
@@ -61,15 +95,7 @@ export const VividoMarkupContent: React.FC<Props> = ({ markup, media, onPressMed
           return <AudioPlayer key={`media-${index}`} uri={item.uri} />;
         }
 
-        const visual = item.type === 'image' ? (
-          <Image source={{ uri: item.uri }} style={styles.image} contentFit="contain" />
-        ) : (
-          <VideoPoster
-            thumbnailUri={item.thumbnail}
-            style={styles.video}
-            label="视频"
-          />
-        );
+        const visual = <VisualMedia item={item} />;
 
         return (
           <TouchableOpacity
@@ -101,14 +127,13 @@ const styles = StyleSheet.create({
   highlight: { backgroundColor: VIVIDO_HIGHLIGHT_COLOR },
   mediaFrame: {
     width: '100%',
-    minHeight: 180,
     marginBottom: 16,
     borderRadius: 12,
     overflow: 'hidden',
     backgroundColor: colors.surface,
   },
-  image: { width: '100%', height: 240 },
-  video: { width: '100%', height: 240 },
+  image: { width: '100%' },
+  video: { width: '100%' },
   missingMedia: {
     minHeight: 64,
     marginBottom: 16,

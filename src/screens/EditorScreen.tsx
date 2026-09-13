@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useCallback, useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -69,7 +69,8 @@ export const EditorScreen: React.FC = () => {
     canUndo: false,
     canRedo: false,
   });
-  const [keyboardVisible, setKeyboardVisible] = useState(false);
+  const [keyboardVisible, setKeyboardVisible] = useState(() => Keyboard.isVisible());
+  const [editorInputFocused, setEditorInputFocused] = useState(false);
   const [editorLoadError, setEditorLoadError] = useState<string | null>(null);
   const [editorMountKey, setEditorMountKey] = useState(0);
   const [entryLoaded, setEntryLoaded] = useState(!isEditing);
@@ -115,6 +116,24 @@ export const EditorScreen: React.FC = () => {
   const manualSaveRef = useRef(false);
   const editorMediaIdsRef = useRef<Set<string>>(new Set());
   const stagedMediaRef = useRef<MediaItem[]>([]);
+  const editorInputOwnerRef = useRef<'editor' | 'other' | null>(null);
+
+  const handleEditorFocusChange = useCallback((focused: boolean) => {
+    if (focused) {
+      editorInputOwnerRef.current = 'editor';
+      setEditorInputFocused(true);
+    } else if (editorInputOwnerRef.current === 'editor') {
+      editorInputOwnerRef.current = null;
+      setEditorInputFocused(false);
+    }
+  }, []);
+
+  const handleNonEditorFocusChange = useCallback((focused: boolean) => {
+    if (focused) {
+      editorInputOwnerRef.current = 'other';
+      setEditorInputFocused(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (isEditing && diaryId) {
@@ -130,6 +149,8 @@ export const EditorScreen: React.FC = () => {
   }, [diaryId]);
 
   useEffect(() => {
+    const syncKeyboardVisibility = () => setKeyboardVisible(Keyboard.isVisible());
+    syncKeyboardVisibility();
     const showSubscription = Keyboard.addListener('keyboardDidShow', () => setKeyboardVisible(true));
     const hideSubscription = Keyboard.addListener('keyboardDidHide', () => setKeyboardVisible(false));
     return () => {
@@ -137,6 +158,19 @@ export const EditorScreen: React.FC = () => {
       hideSubscription.remove();
     };
   }, []);
+
+  useEffect(() => {
+    if (!editorReady || !editorRef.current) return;
+    editorRef.current.setMediaPreviews(
+      media.map((item) => ({
+        mediaId: item.id,
+        mediaType: item.type,
+        uri: item.type === 'image' ? item.uri : undefined,
+        thumbnailUri: item.type === 'video' ? item.thumbnail : undefined,
+        label: item.fileName ?? null,
+      })),
+    );
+  }, [editorReady, media]);
 
   useEffect(() => {
     if (!entryLoaded || editorReady || editorLoadError) return;
@@ -150,6 +184,7 @@ export const EditorScreen: React.FC = () => {
 
   const retryEditor = () => {
     editorRef.current = null;
+    handleNonEditorFocusChange(true);
     setEditorActiveState((current) => ({ ...current, isReady: false }));
     setEditorReady(false);
     setEditorLoadError(null);
@@ -652,6 +687,7 @@ export const EditorScreen: React.FC = () => {
                 placeholderTextColor="#c4b8ae"
                 value={title}
                 onChangeText={setTitle}
+                onFocus={() => handleNonEditorFocusChange(true)}
                 maxLength={100}
                 scrollEnabled={false}
                 autoCorrect={false}
@@ -667,10 +703,21 @@ export const EditorScreen: React.FC = () => {
                   ref={editorRef}
                   initialMarkup={content}
                   showToolbar={false}
-                  onStateChange={setEditorActiveState}
+                  onStateChange={(state) => {
+                    setEditorActiveState(state);
+                    // A delayed false snapshot can follow the native/WebView
+                    // touch event. Only a positive editor snapshot may claim
+                    // ownership; title/tag focus explicitly revokes it.
+                    if (state.isFocused && editorInputOwnerRef.current !== 'other') {
+                      handleEditorFocusChange(true);
+                    }
+                  }}
+                  onFocusChange={handleEditorFocusChange}
                   onReady={(adapter) => {
                     editorRef.current = adapter;
-                    setEditorActiveState(adapter.getActiveState());
+                    const state = adapter.getActiveState();
+                    setEditorActiveState(state);
+                    if (state.isFocused) handleEditorFocusChange(true);
                     setEditorLoadError(null);
                     setEditorReady(true);
                   }}
@@ -739,11 +786,12 @@ export const EditorScreen: React.FC = () => {
             <TagEditor
               selectedTags={tags}
               onTagsChange={setTags}
+              onInputFocus={handleNonEditorFocusChange}
             />
 
             <View style={styles.bottomPadding} />
           </ScrollView>
-          {keyboardVisible && editorReady && !editorLoadError && editorActiveState.isFocused && (
+          {keyboardVisible && editorReady && !editorLoadError && editorInputFocused && (
             <View style={styles.keyboardToolbar}>
               <RichEditorToolbar adapter={editorRef.current} state={editorActiveState} />
             </View>
@@ -989,7 +1037,7 @@ const styles = StyleSheet.create({
     marginVertical: 12,
   },
   editorLoading: {
-    minHeight: 220,
+    minHeight: 120,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1018,7 +1066,7 @@ const styles = StyleSheet.create({
     lineHeight: 30,
     paddingVertical: 8,
     paddingHorizontal: 4,
-    minHeight: 220,
+    minHeight: 120,
     borderWidth: 0,
     backgroundColor: 'transparent',
     fontFamily: 'LXGWWenKaiLite',

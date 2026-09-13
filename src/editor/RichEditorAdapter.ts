@@ -1,5 +1,8 @@
 import type { EditorBridge } from '@10play/tentap-editor';
-import type { VividoMediaEditorInstance } from './integration/VividoMediaBridge';
+import type {
+  VividoMediaEditorInstance,
+  VividoMediaPreview,
+} from './integration/VividoMediaBridge';
 import {
   canonicalizeMarkup,
   htmlToMarkup,
@@ -30,6 +33,8 @@ export interface RichEditorAdapter {
   insertImage(mediaId: string): void;
   insertAudio(mediaId: string): void;
   insertVideo(mediaId: string): void;
+  /** Updates transient editor previews; URIs never enter persisted markup. */
+  setMediaPreviews(previews: VividoMediaPreview[]): void;
   getActiveState(): Readonly<RichEditorActiveState>;
 }
 
@@ -37,6 +42,10 @@ type EditorGetter = () => EditorBridge & VividoMediaEditorInstance;
 const activeStateSetters = new WeakMap<object, (nextState: RichEditorActiveState) => void>();
 
 export const createRichEditorAdapter = (getEditor: EditorGetter): RichEditorAdapter => {
+  let mediaPreviews: VividoMediaPreview[] = [];
+  const syncMediaPreviews = () => {
+    getEditor().setMediaPreviews(mediaPreviews);
+  };
   let state: RichEditorActiveState = {
     isReady: false,
     isBoldActive: false,
@@ -50,6 +59,7 @@ export const createRichEditorAdapter = (getEditor: EditorGetter): RichEditorAdap
   const adapter: RichEditorAdapter = {
     load(markup) {
       getEditor().setContent(markupToHtml(markup));
+      syncMediaPreviews();
     },
     async getMarkup() {
       const html = await getEditor().getHTML();
@@ -72,9 +82,11 @@ export const createRichEditorAdapter = (getEditor: EditorGetter): RichEditorAdap
     },
     undo() {
       getEditor().undo();
+      syncMediaPreviews();
     },
     redo() {
       getEditor().redo();
+      syncMediaPreviews();
     },
     insertImage(mediaId) {
       getEditor().insertImage(mediaId);
@@ -84,6 +96,10 @@ export const createRichEditorAdapter = (getEditor: EditorGetter): RichEditorAdap
     },
     insertVideo(mediaId) {
       getEditor().insertVideo(mediaId);
+    },
+    setMediaPreviews(previews) {
+      mediaPreviews = previews;
+      syncMediaPreviews();
     },
     getActiveState() {
       return Object.freeze({ ...state });

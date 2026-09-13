@@ -19,12 +19,13 @@
         font-weight: 400;
       }
       #root > div:nth-of-type(1) {
-        position: absolute; height: 100%; overflow: auto; width: 100%; top: 0; bottom: 0;
+        position: relative; height: auto; min-height: 120px; overflow: visible; width: 100%;
         background: #f5f0e6;
       }
-      #root > div.dynamic-height { height: unset; }
+      #root > div.dynamic-height { height: auto; overflow: visible; }
       #root div .ProseMirror {
-        min-height: 100%;
+        min-height: 120px;
+        height: auto;
         overflow: visible;
         box-sizing: border-box;
         padding: 12px 16px 24px;
@@ -38,7 +39,7 @@
       #root div .ProseMirror strong { font-weight: 700; }
       #root div .ProseMirror em { font-style: italic; }
       #root div .ProseMirror mark { background: #fff2a8; color: inherit; }
-      #root div.dynamic-height .ProseMirror { height: unset; }
+      #root div.dynamic-height .ProseMirror { height: auto; }
       .ProseMirror:focus { outline: none; }
     </style>
   </body>

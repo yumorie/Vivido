@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Platform, StyleProp, StyleSheet, Text, View, ViewStyle } from 'react-native';
 import { Image } from 'expo-image';
-import { useVideoPlayer } from 'expo-video';
+import { createVideoPlayer } from 'expo-video';
 import type { SharedRefType } from 'expo';
 
 interface VideoPosterProps {
@@ -10,6 +10,7 @@ interface VideoPosterProps {
   style?: StyleProp<ViewStyle>;
   label?: string;
   enableGeneratedThumbnail?: boolean;
+  onAspectRatioChange?: (aspectRatio: number) => void;
 }
 
 export const VideoPoster: React.FC<VideoPosterProps> = ({
@@ -18,10 +19,10 @@ export const VideoPoster: React.FC<VideoPosterProps> = ({
   style,
   label = '视频',
   enableGeneratedThumbnail = false,
+  onAspectRatioChange,
 }) => {
   const shouldGenerateThumbnail =
     enableGeneratedThumbnail && !thumbnailUri && Boolean(videoUri) && Platform.OS !== 'web';
-  const player = useVideoPlayer(shouldGenerateThumbnail ? videoUri ?? null : null);
   const [generatedThumbnail, setGeneratedThumbnail] = useState<SharedRefType<'image'> | null>(null);
   const generatedThumbnailRef = useRef<SharedRefType<'image'> | null>(null);
 
@@ -37,13 +38,16 @@ export const VideoPoster: React.FC<VideoPosterProps> = ({
   }, []);
 
   useEffect(() => {
-    return () => {
-      player.release();
-    };
-  }, [player]);
-
-  useEffect(() => {
     let cancelled = false;
+    let player: ReturnType<typeof createVideoPlayer> | null = null;
+    let playerReleased = false;
+    const releasePlayer = () => {
+      if (player && !playerReleased) {
+        player.release();
+        playerReleased = true;
+      }
+      player = null;
+    };
 
     if (!shouldGenerateThumbnail) {
       replaceGeneratedThumbnail(null);
@@ -52,12 +56,15 @@ export const VideoPoster: React.FC<VideoPosterProps> = ({
 
     const generateThumbnail = async () => {
       try {
+        player = createVideoPlayer(videoUri!);
+        playerReleased = false;
         const thumbnails = await player.generateThumbnailsAsync([0.1], {
           maxWidth: 1200,
           maxHeight: 1200,
         });
 
         const firstThumbnail = thumbnails[0] ?? null;
+        releasePlayer();
 
         if (cancelled) {
           (firstThumbnail as { release?: () => void } | null)?.release?.();
@@ -66,6 +73,7 @@ export const VideoPoster: React.FC<VideoPosterProps> = ({
 
         replaceGeneratedThumbnail(firstThumbnail);
       } catch (error) {
+        releasePlayer();
         if (!cancelled) {
           replaceGeneratedThumbnail(null);
         }
@@ -76,8 +84,9 @@ export const VideoPoster: React.FC<VideoPosterProps> = ({
 
     return () => {
       cancelled = true;
+      releasePlayer();
     };
-  }, [player, replaceGeneratedThumbnail, shouldGenerateThumbnail]);
+  }, [replaceGeneratedThumbnail, shouldGenerateThumbnail, videoUri]);
 
   useEffect(() => {
     return () => {
@@ -92,7 +101,15 @@ export const VideoPoster: React.FC<VideoPosterProps> = ({
   return (
     <View style={[styles.container, style]}>
       {imageSource ? (
-        <Image source={imageSource} style={StyleSheet.absoluteFillObject} contentFit="cover" />
+        <Image
+          source={imageSource}
+          style={StyleSheet.absoluteFillObject}
+          contentFit="cover"
+          onLoad={(event) => {
+            const { width, height } = event.source;
+            if (width > 0 && height > 0) onAspectRatioChange?.(width / height);
+          }}
+        />
       ) : (
         <View style={styles.fallback}>
           <Text style={styles.fallbackTitle}>{label}</Text>

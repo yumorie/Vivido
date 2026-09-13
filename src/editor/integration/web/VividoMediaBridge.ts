@@ -4,6 +4,7 @@ import { BridgeExtension } from '@10play/tentap-editor/web';
 import type {
   VividoMediaAction,
   VividoMediaEditorInstance,
+  VividoMediaPreview,
   VividoMediaType,
 } from '../VividoMediaBridge';
 import { VIVIDO_MEDIA_BRIDGE_NAME } from '../VividoMediaContract';
@@ -59,13 +60,20 @@ const createMediaNode = (mediaType: VividoMediaType) =>
       ];
     },
     renderHTML({ HTMLAttributes }) {
+      const label = mediaType === 'image' ? '图片' : mediaType === 'audio' ? '录音' : '视频';
       return [
         'div',
         mergeAttributes(HTMLAttributes, {
           'data-vivido-media-type': mediaType,
-          'data-vivido-media-label': mediaType === 'image' ? '图片' : mediaType === 'audio' ? '录音' : '视频',
+          'data-vivido-media-label': label,
           class: `vivido-media vivido-media-${mediaType}`,
         }),
+        [
+          'div',
+          { class: 'vivido-media-content' },
+          ['span', { class: 'vivido-media-label' }, label],
+          ['span', { class: 'vivido-media-id' }, HTMLAttributes['data-vivido-media-id'] ?? ''],
+        ],
       ];
     },
   });
@@ -73,6 +81,93 @@ const createMediaNode = (mediaType: VividoMediaType) =>
 const imageNode = createMediaNode('image');
 const audioNode = createMediaNode('audio');
 const videoNode = createMediaNode('video');
+
+const previewUriPattern = /^(?:file|content):\/\//i;
+let previewCache: VividoMediaPreview[] = [];
+let previewObserver: MutationObserver | null = null;
+let previewObserverTarget: Element | null = null;
+let previewRefreshQueued = false;
+
+const isSafePreviewUri = (uri: string | undefined): uri is string =>
+  Boolean(uri && previewUriPattern.test(uri) && !/^data:/i.test(uri));
+
+const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
+  const previewById = new Map(
+    previews
+      .filter((preview) => mediaIdPattern.test(preview.mediaId))
+      .map((preview) => [preview.mediaId, preview]),
+  );
+
+  document.querySelectorAll<HTMLElement>('.vivido-media').forEach((element) => {
+    const mediaId = element.getAttribute('data-vivido-media-id') ?? '';
+    const mediaType = element.getAttribute('data-vivido-media-type') as VividoMediaType | null;
+    const content = element.querySelector<HTMLElement>('.vivido-media-content');
+    if (!content || !mediaType) return;
+
+    const preview = previewById.get(mediaId);
+    if (!force && (!preview || preview.mediaType !== mediaType)) return;
+    if (!force) {
+      const needsImagePreview =
+        mediaType === 'image' && isSafePreviewUri(preview?.uri) &&
+        !content.querySelector('.vivido-media-image-preview');
+      const needsVideoPreview =
+        mediaType === 'video' && isSafePreviewUri(preview?.thumbnailUri) &&
+        !content.querySelector('.vivido-media-video-preview');
+      if (!needsImagePreview && !needsVideoPreview) return;
+    }
+    while (content.firstChild) content.removeChild(content.firstChild);
+    if (!preview || preview.mediaType !== mediaType) {
+      const fallback = document.createElement('span');
+      fallback.className = 'vivido-media-label vivido-media-fallback';
+      fallback.textContent = element.getAttribute('data-vivido-media-label') ?? mediaType;
+      content.appendChild(fallback);
+    } else if (mediaType === 'image' && isSafePreviewUri(preview.uri)) {
+      const image = document.createElement('img');
+      image.className = 'vivido-media-preview vivido-media-image-preview';
+      image.src = preview.uri;
+      image.alt = preview.label ?? '图片';
+      content.appendChild(image);
+    } else if (mediaType === 'video' && isSafePreviewUri(preview.thumbnailUri)) {
+      const image = document.createElement('img');
+      image.className = 'vivido-media-preview vivido-media-video-preview';
+      image.src = preview.thumbnailUri;
+      image.alt = preview.label ?? '视频缩略图';
+      content.appendChild(image);
+      const badge = document.createElement('span');
+      badge.className = 'vivido-media-badge';
+      badge.textContent = '视频';
+      content.appendChild(badge);
+    } else {
+      const fallback = document.createElement('span');
+      fallback.className = 'vivido-media-label vivido-media-fallback';
+      fallback.textContent = preview.label ?? (mediaType === 'audio' ? '录音' : '视频');
+      content.appendChild(fallback);
+    }
+
+    const id = document.createElement('span');
+    id.className = 'vivido-media-id';
+    id.textContent = mediaId;
+    content.appendChild(id);
+  });
+};
+
+const observePreviewDom = () => {
+  const target = document.querySelector('.ProseMirror');
+  if (target === previewObserverTarget) return;
+  previewObserver?.disconnect();
+  previewObserverTarget = target;
+  previewObserver = target
+    ? new MutationObserver(() => {
+        if (previewRefreshQueued) return;
+        previewRefreshQueued = true;
+        Promise.resolve().then(() => {
+          previewRefreshQueued = false;
+          renderPreviewCards(previewCache, false);
+        });
+      })
+    : null;
+  previewObserver?.observe(target!, { childList: true, subtree: true });
+};
 
 const insertMedia = (editor: Editor, mediaType: VividoMediaType, mediaId: string) => {
   if (!['image', 'audio', 'video'].includes(mediaType) || !mediaIdPattern.test(mediaId)) return false;
@@ -109,22 +204,48 @@ const vividoMediaBridge = new BridgeExtension<
   forceName: VIVIDO_MEDIA_BRIDGE_NAME,
   tiptapExtension: imageNode,
   tiptapExtensionDeps: [audioNode, videoNode],
-  onBridgeMessage: (editor, message) =>
-    message.type === 'insert-media'
-      ? insertMedia(editor, message.payload.mediaType, message.payload.mediaId)
-      : false,
+  onBridgeMessage: (editor, message) => {
+    if (message.type === 'insert-media') {
+      return insertMedia(editor, message.payload.mediaType, message.payload.mediaId);
+    }
+    if (message.type === 'set-media-previews') {
+      // Preview updates are DOM-only runtime state; they do not create a
+      // ProseMirror transaction and therefore cannot enter history/markup.
+      previewCache = message.payload.previews;
+      observePreviewDom();
+      renderPreviewCards(previewCache);
+      return true;
+    }
+    return false;
+  },
   extendCSS: `
-    .vivido-media { display: block; min-height: 48px; margin: 8px 0; padding: 12px; }
+    .vivido-media { display: block; min-height: 72px; margin: 8px 0; padding: 10px; box-sizing: border-box; }
     .vivido-media-image, .vivido-media-audio, .vivido-media-video {
-      border: 1px dashed currentColor;
+      border: 1px solid currentColor;
       border-radius: 8px;
       position: relative;
     }
-    .vivido-media::before {
-      content: attr(data-vivido-media-label) ' · ' attr(data-vivido-media-id);
-      display: block;
-      font-size: 14px;
-      opacity: .75;
+    .vivido-media-content { display: flex; min-width: 0; min-height: 48px; align-items: center; gap: 8px; }
+    .vivido-media-image .vivido-media-content, .vivido-media-video .vivido-media-content {
+      flex-direction: column; align-items: stretch; gap: 6px;
+    }
+    .vivido-media-audio .vivido-media-content { flex-direction: row; align-items: center; }
+    .vivido-media-label, .vivido-media-id, .vivido-media-badge { display: inline-block; }
+    .vivido-media-label { font-size: 15px; font-weight: 600; }
+    .vivido-media-fallback {
+      min-height: 48px; padding: 10px 12px; box-sizing: border-box;
+      border-radius: 6px; background: rgba(61,44,30,.08); color: currentColor;
+    }
+    .vivido-media-id {
+      display: block; min-width: 0; max-width: 100%; font-size: 11px; opacity: .65;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .vivido-media-preview { display: block; max-width: 100%; object-fit: contain; }
+    .vivido-media-image-preview { width: 100%; max-height: 360px; }
+    .vivido-media-video-preview { width: 100%; max-height: 260px; }
+    .vivido-media-badge {
+      position: absolute; left: 18px; bottom: 16px; padding: 3px 7px;
+      border-radius: 5px; background: rgba(0,0,0,.62); color: #fff; font-size: 14px;
     }
   `,
 });

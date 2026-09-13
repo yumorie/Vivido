@@ -16,11 +16,13 @@ import type { TagSuggestion } from '../utils/tagSearch';
 interface TagEditorProps {
   selectedTags: Tag[];
   onTagsChange: (tags: Tag[]) => void;
+  onInputFocus?: (focused: boolean) => void;
 }
 
 export const TagEditor: React.FC<TagEditorProps> = ({
   selectedTags,
   onTagsChange,
+  onInputFocus,
 }) => {
   const [allTags, setAllTags] = useState<TagSuggestion[]>([]);
   const [showInput, setShowInput] = useState(false);
@@ -118,6 +120,8 @@ export const TagEditor: React.FC<TagEditorProps> = ({
             multiline={false}
             numberOfLines={1}
             scrollEnabled={false}
+            onFocus={() => onInputFocus?.(true)}
+            onBlur={() => onInputFocus?.(false)}
             onSubmitEditing={handleCreateTag}
           />
           <TouchableOpacity
