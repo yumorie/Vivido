@@ -18,7 +18,15 @@ export interface RichEditorActiveState {
   isFocused: boolean;
   canUndo: boolean;
   canRedo: boolean;
+  /** Read-only WebView caret geometry, relative to the editor document. */
+  caretRect: RichEditorCaretRect | null;
 }
+
+export type RichEditorCaretRect = Readonly<{
+  top: number;
+  bottom: number;
+  height: number;
+}>;
 
 export interface RichEditorAdapter {
   load(markup: string): void;
@@ -54,6 +62,7 @@ export const createRichEditorAdapter = (getEditor: EditorGetter): RichEditorAdap
     isFocused: false,
     canUndo: false,
     canRedo: false,
+    caretRect: null,
   };
 
   const adapter: RichEditorAdapter = {

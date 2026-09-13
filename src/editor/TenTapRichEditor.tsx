@@ -12,7 +12,7 @@ import {
   useEditorBridge,
 } from '@10play/tentap-editor';
 import type { EditorBridge } from '@10play/tentap-editor';
-import type { RichEditorActiveState, RichEditorAdapter } from './RichEditorAdapter';
+import type { RichEditorActiveState, RichEditorAdapter, RichEditorCaretRect } from './RichEditorAdapter';
 import { createRichEditorAdapter, updateRichEditorActiveState } from './RichEditorAdapter';
 import { markupToHtml, VIVIDO_HIGHLIGHT_COLOR } from './codec/VividoMarkupCodec';
 import { VIVIDO_EDITOR_PAPER_BG } from './editorTheme';
@@ -121,6 +121,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
         isFocused: Boolean(editorState.isFocused),
         canUndo: Boolean(editorState.canUndo),
         canRedo: Boolean(editorState.canRedo),
+        caretRect: (editorState as { caretRect?: RichEditorCaretRect | null }).caretRect ?? null,
       });
       onStateChangeRef.current?.(adapter.getActiveState());
     }, [adapter, editorState, initialMarkup]);
@@ -140,6 +141,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
         isFocused: Boolean(currentState.isFocused),
         canUndo: Boolean(currentState.canUndo),
         canRedo: Boolean(currentState.canRedo),
+        caretRect: (currentState as { caretRect?: RichEditorCaretRect | null }).caretRect ?? null,
       });
       const usesInjectedInitialContent =
         !initialContentConfirmedRef.current && mountedInitialMarkupRef.current === markup;
@@ -171,6 +173,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
           isFocused: Boolean(confirmedState.isFocused),
           canUndo: Boolean(confirmedState.canUndo),
           canRedo: Boolean(confirmedState.canRedo),
+          caretRect: (confirmedState as { caretRect?: RichEditorCaretRect | null }).caretRect ?? null,
         });
         onReadyRef.current?.(adapter);
       } catch (error) {

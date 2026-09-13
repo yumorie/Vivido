@@ -14,6 +14,11 @@ import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
+import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
+import type { ImageManipulatorContext, ImageRef } from 'expo-image-manipulator';
+import { createVideoPlayer } from 'expo-video';
+import type { SharedRefType } from 'expo';
+import { deleteAsync } from 'expo-file-system/legacy';
 import { DatePickerModal } from '../components/DatePickerModal';
 import { RootStackParamList, DiaryEntry, MediaItem, Tag } from '../types';
 import { getDiaryById, createDiary, updateDiary, saveDraft, getDraft, deleteDraft, isMediaReferenced, Draft } from '../services/database';
@@ -47,6 +52,26 @@ const BRAND_GOLD = '#c47030';
 
 const getDraftId = (diaryId?: string): string => diaryId || 'new';
 
+type ReleasableNativeRef = { release?: () => void };
+
+const releaseNativeRef = (ref: ReleasableNativeRef | null): void => {
+  try {
+    ref?.release?.();
+  } catch (error) {
+    // Release is best-effort; a failed native cleanup must not affect editing.
+    console.warn('Failed to release transient video preview resource:', error);
+  }
+};
+
+const deleteTransientPreview = async (uri: string): Promise<void> => {
+  try {
+    await deleteAsync(uri, { idempotent: true });
+  } catch (error) {
+    // Cache cleanup is deliberately non-fatal and never touches persisted media.
+    console.warn('Failed to delete transient video preview:', error);
+  }
+};
+
 export const EditorScreen: React.FC = () => {
   const navigation = useNavigation<NavigationProp>();
   const route = useRoute<EditorRouteProp>();
@@ -68,6 +93,7 @@ export const EditorScreen: React.FC = () => {
     isFocused: false,
     canUndo: false,
     canRedo: false,
+    caretRect: null,
   });
   const [keyboardVisible, setKeyboardVisible] = useState(() => Keyboard.isVisible());
   const [editorInputFocused, setEditorInputFocused] = useState(false);
@@ -75,6 +101,8 @@ export const EditorScreen: React.FC = () => {
   const [editorMountKey, setEditorMountKey] = useState(0);
   const [entryLoaded, setEntryLoaded] = useState(!isEditing);
   const [contentLength, setContentLength] = useState(0);
+  const [runtimeVideoPreviews, setRuntimeVideoPreviews] = useState<Record<string, string>>({});
+  const [videoPreviewWake, setVideoPreviewWake] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [originalMedia, setOriginalMedia] = useState<MediaItem[]>([]);
   const [initialCreatedAt, setInitialCreatedAt] = useState(Date.now());
@@ -117,6 +145,24 @@ export const EditorScreen: React.FC = () => {
   const editorMediaIdsRef = useRef<Set<string>>(new Set());
   const stagedMediaRef = useRef<MediaItem[]>([]);
   const editorInputOwnerRef = useRef<'editor' | 'other' | null>(null);
+  const runtimeVideoPreviewsRef = useRef(new Map<string, string>());
+  const generatedVideoPreviewUrisRef = useRef(new Map<string, string>());
+  const generatedVideoPreviewSourcesRef = useRef(new Map<string, string>());
+  const attemptedVideoPreviewIdsRef = useRef(new Set<string>());
+  const failedVideoPreviewIdsRef = useRef(new Set<string>());
+  const videoPreviewWorkerRef = useRef<Promise<void> | null>(null);
+  const observedVideoPreviewWorkerRef = useRef<Promise<void> | null>(null);
+  const editorReadyRef = useRef(editorReady);
+  const videoPreviewGenerationRef = useRef(0);
+  const mountedRef = useRef(true);
+  const editorScrollRef = useRef<ScrollView | null>(null);
+  const editorAreaTopRef = useRef(0);
+  const editorHostTopRef = useRef(0);
+  const scrollOffsetRef = useRef(0);
+  const scrollViewportHeightRef = useRef(0);
+  const keyboardToolbarHeightRef = useRef(0);
+
+  editorReadyRef.current = editorReady;
 
   const handleEditorFocusChange = useCallback((focused: boolean) => {
     if (focused) {
@@ -134,6 +180,37 @@ export const EditorScreen: React.FC = () => {
       setEditorInputFocused(false);
     }
   }, []);
+
+  const ensureCaretVisible = useCallback(() => {
+    const caret = editorActiveState.caretRect;
+    if (!keyboardVisible || !editorInputFocused || !editorReady || !caret) return;
+    const viewportHeight = scrollViewportHeightRef.current;
+    if (viewportHeight <= 0) return;
+    const scrollOffset = scrollOffsetRef.current;
+    const caretTop = editorAreaTopRef.current + editorHostTopRef.current + caret.top;
+    const caretBottom = editorAreaTopRef.current + editorHostTopRef.current + caret.bottom;
+    const safeTop = scrollOffset + 12;
+    // The toolbar is a normal sibling below the ScrollView. Its measured
+    // height is already reserved by flex layout; subtracting it again would
+    // double-count the keyboard avoidance area.
+    const safeBottom = scrollOffset + viewportHeight - 12;
+    let target = scrollOffset;
+    if (caretBottom > safeBottom) target += caretBottom - safeBottom;
+    else if (caretTop < safeTop) target -= safeTop - caretTop;
+    target = Math.max(0, target);
+    if (Math.abs(target - scrollOffset) < 2) return;
+    editorScrollRef.current?.scrollTo({ y: target, animated: false });
+  }, [editorActiveState.caretRect, editorInputFocused, editorReady, keyboardVisible]);
+
+  useEffect(() => {
+    let frame: number | null = requestAnimationFrame(() => {
+      frame = null;
+      ensureCaretVisible();
+    });
+    return () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [ensureCaretVisible]);
 
   useEffect(() => {
     if (isEditing && diaryId) {
@@ -166,11 +243,191 @@ export const EditorScreen: React.FC = () => {
         mediaId: item.id,
         mediaType: item.type,
         uri: item.type === 'image' ? item.uri : undefined,
-        thumbnailUri: item.type === 'video' ? item.thumbnail : undefined,
+        thumbnailUri:
+          item.type === 'video'
+            ? runtimeVideoPreviews[item.id] ?? item.thumbnail
+            : undefined,
         label: item.fileName ?? null,
       })),
     );
-  }, [editorReady, media]);
+  }, [editorReady, media, runtimeVideoPreviews]);
+
+  // VideoThumbnail is a native SharedRef and cannot cross the WebView boundary.
+  // Convert one missing video preview at a time into a cache file URI. This is
+  // intentionally tied to the media collection, never to text transactions.
+  useEffect(() => {
+    // A media/editor change can happen while native thumbnail generation is
+    // awaiting. Keep the latest collection visible to the one active worker.
+    // A completed worker wakes this effect once, so a cancelled item is queued
+    // again only after every native ref/player from the old worker is released.
+    if (!editorReady) return;
+
+    if (videoPreviewWorkerRef.current) {
+      const worker = videoPreviewWorkerRef.current;
+      if (observedVideoPreviewWorkerRef.current !== worker) {
+        observedVideoPreviewWorkerRef.current = worker;
+        void worker.then(() => {
+          if (observedVideoPreviewWorkerRef.current === worker) {
+            observedVideoPreviewWorkerRef.current = null;
+          }
+          if (mountedRef.current) setVideoPreviewWake((current) => current + 1);
+        }, () => {
+          if (observedVideoPreviewWorkerRef.current === worker) {
+            observedVideoPreviewWorkerRef.current = null;
+          }
+          if (mountedRef.current) setVideoPreviewWake((current) => current + 1);
+        });
+      }
+      return;
+    }
+
+    const generation = ++videoPreviewGenerationRef.current;
+    let cancelled = false;
+    const candidates = media.filter(
+      (item) =>
+        item.type === 'video' &&
+        !item.thumbnail &&
+        !runtimeVideoPreviewsRef.current.has(item.id) &&
+        !attemptedVideoPreviewIdsRef.current.has(item.id) &&
+        !failedVideoPreviewIdsRef.current.has(item.id),
+    );
+
+    for (const item of candidates) attemptedVideoPreviewIdsRef.current.add(item.id);
+
+    const generateMissingPreviews = async () => {
+      for (const item of candidates) {
+        if (cancelled || !mountedRef.current || generation !== videoPreviewGenerationRef.current) {
+          return;
+        }
+
+        let player: ReturnType<typeof createVideoPlayer> | null = null;
+        let thumbnail: SharedRefType<'image'> | null = null;
+        let context: ImageManipulatorContext | null = null;
+        let imageRef: ImageRef | null = null;
+        let savedUri: string | null = null;
+
+        try {
+          player = createVideoPlayer(item.uri);
+          const thumbnails = await player.generateThumbnailsAsync([0.1], {
+            maxWidth: 1200,
+            maxHeight: 1200,
+          });
+          thumbnail = thumbnails[0] ?? null;
+          if (!thumbnail) continue;
+
+          context = ImageManipulator.manipulate(thumbnail);
+          imageRef = await context.renderAsync();
+          const result = await imageRef.saveAsync({
+            format: SaveFormat.JPEG,
+            base64: false,
+            compress: 0.82,
+          });
+          savedUri = result.uri;
+
+          if (cancelled || !mountedRef.current || generation !== videoPreviewGenerationRef.current) {
+            await deleteTransientPreview(savedUri);
+            continue;
+          }
+
+          runtimeVideoPreviewsRef.current.set(item.id, savedUri);
+          generatedVideoPreviewUrisRef.current.set(item.id, savedUri);
+          generatedVideoPreviewSourcesRef.current.set(item.id, item.uri);
+          setRuntimeVideoPreviews((current) => ({ ...current, [item.id]: savedUri! }));
+        } catch (error) {
+          console.warn(`Failed to generate video preview for ${item.id}:`, error);
+          if (!cancelled && mountedRef.current && generation === videoPreviewGenerationRef.current) {
+            // Keep a genuine failure on the fallback for this session; a
+            // cancelled worker is deliberately left eligible for requeue.
+            failedVideoPreviewIdsRef.current.add(item.id);
+          }
+        } finally {
+          releaseNativeRef(imageRef);
+          releaseNativeRef(context);
+          releaseNativeRef(thumbnail);
+          releaseNativeRef(player);
+        }
+      }
+    };
+
+    const worker = generateMissingPreviews();
+    videoPreviewWorkerRef.current = worker;
+    void worker.then(() => {
+      if (videoPreviewWorkerRef.current === worker) {
+        videoPreviewWorkerRef.current = null;
+      }
+    }, () => {
+      if (videoPreviewWorkerRef.current === worker) {
+        videoPreviewWorkerRef.current = null;
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (videoPreviewGenerationRef.current === generation) {
+        videoPreviewGenerationRef.current += 1;
+      }
+      if (!editorReadyRef.current) failedVideoPreviewIdsRef.current.clear();
+      for (const item of candidates) {
+        if (
+          !runtimeVideoPreviewsRef.current.has(item.id) &&
+          !failedVideoPreviewIdsRef.current.has(item.id)
+        ) {
+          attemptedVideoPreviewIdsRef.current.delete(item.id);
+        }
+      }
+    };
+  }, [editorReady, media, videoPreviewWake]);
+
+  // A removed media block may leave only a generated cache file. It is safe to
+  // remove that transient file now; persisted media and thumbnails are excluded.
+  useEffect(() => {
+    const activeItems = new Map(media.map((item) => [item.id, item]));
+    for (const [mediaId, uri] of generatedVideoPreviewUrisRef.current) {
+      const activeItem = activeItems.get(mediaId);
+      const generatedSource = generatedVideoPreviewSourcesRef.current.get(mediaId);
+      if (
+        !activeItem ||
+        activeItem.type !== 'video' ||
+        activeItem.thumbnail ||
+        (generatedSource !== undefined && generatedSource !== activeItem.uri)
+      ) {
+        generatedVideoPreviewUrisRef.current.delete(mediaId);
+        generatedVideoPreviewSourcesRef.current.delete(mediaId);
+        runtimeVideoPreviewsRef.current.delete(mediaId);
+        void deleteTransientPreview(uri);
+        setVideoPreviewWake((current) => current + 1);
+        setRuntimeVideoPreviews((current) => {
+          if (!(mediaId in current)) return current;
+          const next = { ...current };
+          delete next[mediaId];
+          return next;
+        });
+        if (activeItem?.thumbnail) {
+          attemptedVideoPreviewIdsRef.current.delete(mediaId);
+          failedVideoPreviewIdsRef.current.delete(mediaId);
+        }
+      }
+    }
+    for (const mediaId of attemptedVideoPreviewIdsRef.current) {
+      if (!activeItems.has(mediaId)) attemptedVideoPreviewIdsRef.current.delete(mediaId);
+    }
+    for (const mediaId of failedVideoPreviewIdsRef.current) {
+      if (!activeItems.has(mediaId)) failedVideoPreviewIdsRef.current.delete(mediaId);
+    }
+  }, [media]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      videoPreviewGenerationRef.current += 1;
+      for (const uri of generatedVideoPreviewUrisRef.current.values()) {
+        void deleteTransientPreview(uri);
+      }
+      generatedVideoPreviewUrisRef.current.clear();
+      generatedVideoPreviewSourcesRef.current.clear();
+      runtimeVideoPreviewsRef.current.clear();
+    };
+  }, []);
 
   useEffect(() => {
     if (!entryLoaded || editorReady || editorLoadError) return;
@@ -661,10 +918,19 @@ export const EditorScreen: React.FC = () => {
           </View>
 
           <ScrollView
+            ref={editorScrollRef}
             style={styles.mediaScroll}
             contentContainerStyle={styles.scrollContentContainer}
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
+            scrollEventThrottle={16}
+            onLayout={(event) => {
+              scrollViewportHeightRef.current = event.nativeEvent.layout.height;
+              ensureCaretVisible();
+            }}
+            onScroll={(event) => {
+              scrollOffsetRef.current = event.nativeEvent.contentOffset.y;
+            }}
           >
             {/* Date selector */}
             <View style={styles.dateRow}>
@@ -680,7 +946,12 @@ export const EditorScreen: React.FC = () => {
             </View>
 
             {/* Title & Content area */}
-            <View style={styles.editorArea}>
+            <View
+              style={styles.editorArea}
+              onLayout={(event) => {
+                editorAreaTopRef.current = event.nativeEvent.layout.y;
+              }}
+            >
               <TextInput
                 style={styles.titleInput}
                 placeholder="标题（选填）"
@@ -698,37 +969,43 @@ export const EditorScreen: React.FC = () => {
               />
               <View style={styles.divider} />
               {entryLoaded && !editorLoadError ? (
-                <RichEditorHost
-                  key={editorMountKey}
-                  ref={editorRef}
-                  initialMarkup={content}
-                  showToolbar={false}
-                  onStateChange={(state) => {
-                    setEditorActiveState(state);
-                    // A delayed false snapshot can follow the native/WebView
-                    // touch event. Only a positive editor snapshot may claim
-                    // ownership; title/tag focus explicitly revokes it.
-                    if (state.isFocused && editorInputOwnerRef.current !== 'other') {
-                      handleEditorFocusChange(true);
-                    }
+                <View
+                  onLayout={(event) => {
+                    editorHostTopRef.current = event.nativeEvent.layout.y;
                   }}
-                  onFocusChange={handleEditorFocusChange}
-                  onReady={(adapter) => {
-                    editorRef.current = adapter;
-                    const state = adapter.getActiveState();
-                    setEditorActiveState(state);
-                    if (state.isFocused) handleEditorFocusChange(true);
-                    setEditorLoadError(null);
-                    setEditorReady(true);
-                  }}
-                  onDirty={() => {
-                    if (!editorDirtyRef.current) {
-                      editorDirtyRef.current = true;
-                      setHasUnsavedChanges(true);
-                    }
-                    scheduleEditorDraftSave();
-                  }}
-                />
+                >
+                  <RichEditorHost
+                    key={editorMountKey}
+                    ref={editorRef}
+                    initialMarkup={content}
+                    showToolbar={false}
+                    onStateChange={(state) => {
+                      setEditorActiveState(state);
+                      // A delayed false snapshot can follow the native/WebView
+                      // touch event. Only a positive editor snapshot may claim
+                      // ownership; title/tag focus explicitly revokes it.
+                      if (state.isFocused && editorInputOwnerRef.current !== 'other') {
+                        handleEditorFocusChange(true);
+                      }
+                    }}
+                    onFocusChange={handleEditorFocusChange}
+                    onReady={(adapter) => {
+                      editorRef.current = adapter;
+                      const state = adapter.getActiveState();
+                      setEditorActiveState(state);
+                      if (state.isFocused) handleEditorFocusChange(true);
+                      setEditorLoadError(null);
+                      setEditorReady(true);
+                    }}
+                    onDirty={() => {
+                      if (!editorDirtyRef.current) {
+                        editorDirtyRef.current = true;
+                        setHasUnsavedChanges(true);
+                      }
+                      scheduleEditorDraftSave();
+                    }}
+                  />
+                </View>
               ) : editorLoadError ? (
                 <View style={styles.editorLoading}>
                   <Text style={styles.editorLoadingText}>{editorLoadError}</Text>
@@ -792,7 +1069,16 @@ export const EditorScreen: React.FC = () => {
             <View style={styles.bottomPadding} />
           </ScrollView>
           {keyboardVisible && editorReady && !editorLoadError && editorInputFocused && (
-            <View style={styles.keyboardToolbar}>
+            <View
+              style={styles.keyboardToolbar}
+              onLayout={(event) => {
+                const height = event.nativeEvent.layout.height;
+                if (height !== keyboardToolbarHeightRef.current) {
+                  keyboardToolbarHeightRef.current = height;
+                  ensureCaretVisible();
+                }
+              }}
+            >
               <RichEditorToolbar adapter={editorRef.current} state={editorActiveState} />
             </View>
           )}
@@ -1105,10 +1391,7 @@ const styles = StyleSheet.create({
     height: 40,
   },
   keyboardToolbar: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
+    flexShrink: 0,
     paddingHorizontal: 12,
     paddingTop: 6,
     paddingBottom: 6,

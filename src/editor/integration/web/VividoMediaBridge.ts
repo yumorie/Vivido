@@ -68,12 +68,6 @@ const createMediaNode = (mediaType: VividoMediaType) =>
           'data-vivido-media-label': label,
           class: `vivido-media vivido-media-${mediaType}`,
         }),
-        [
-          'div',
-          { class: 'vivido-media-content' },
-          ['span', { class: 'vivido-media-label' }, label],
-          ['span', { class: 'vivido-media-id' }, HTMLAttributes['data-vivido-media-id'] ?? ''],
-        ],
       ];
     },
   });
@@ -91,6 +85,36 @@ let previewRefreshQueued = false;
 const isSafePreviewUri = (uri: string | undefined): uri is string =>
   Boolean(uri && previewUriPattern.test(uri) && !/^data:/i.test(uri));
 
+const syncNaturalImageSize = (image: HTMLImageElement) => {
+  const apply = () => {
+    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+      image.style.aspectRatio = `${image.naturalWidth} / ${image.naturalHeight}`;
+      image.style.height = 'auto';
+    }
+  };
+  image.addEventListener('load', apply, { once: true });
+  apply();
+};
+
+/** Read-only caret geometry for the native outer-scroll visibility helper. */
+const readCaretRect = () => {
+  const selection = window.getSelection();
+  const editorElement = document.querySelector<HTMLElement>('.ProseMirror');
+  if (!selection || !editorElement || selection.rangeCount === 0 || !selection.isCollapsed) {
+    return null;
+  }
+  const range = selection.getRangeAt(0).cloneRange();
+  range.collapse(true);
+  const rect = range.getBoundingClientRect();
+  const editorRect = editorElement.getBoundingClientRect();
+  if (rect.height <= 0) return null;
+  return {
+    top: rect.top - editorRect.top,
+    bottom: rect.bottom - editorRect.top,
+    height: rect.height,
+  };
+};
+
 const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
   const previewById = new Map(
     previews
@@ -101,8 +125,13 @@ const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
   document.querySelectorAll<HTMLElement>('.vivido-media').forEach((element) => {
     const mediaId = element.getAttribute('data-vivido-media-id') ?? '';
     const mediaType = element.getAttribute('data-vivido-media-type') as VividoMediaType | null;
-    const content = element.querySelector<HTMLElement>('.vivido-media-content');
-    if (!content || !mediaType) return;
+    if (!mediaType) return;
+    let content = element.querySelector<HTMLElement>('.vivido-media-content');
+    if (!content) {
+      content = document.createElement('div');
+      content.className = 'vivido-media-content';
+      element.appendChild(content);
+    }
 
     const preview = previewById.get(mediaId);
     if (!force && (!preview || preview.mediaType !== mediaType)) return;
@@ -113,13 +142,19 @@ const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
       const needsVideoPreview =
         mediaType === 'video' && isSafePreviewUri(preview?.thumbnailUri) &&
         !content.querySelector('.vivido-media-video-preview');
-      if (!needsImagePreview && !needsVideoPreview) return;
+      const needsFallbackPreview =
+        !preview || preview.mediaType !== mediaType ||
+        (mediaType === 'image' && !isSafePreviewUri(preview?.uri)) ||
+        mediaType === 'audio' ||
+        (mediaType === 'video' && !isSafePreviewUri(preview?.thumbnailUri));
+      if (!needsImagePreview && !needsVideoPreview &&
+          !(needsFallbackPreview && !content.querySelector('.vivido-media-fallback'))) return;
     }
     while (content.firstChild) content.removeChild(content.firstChild);
     if (!preview || preview.mediaType !== mediaType) {
       const fallback = document.createElement('span');
       fallback.className = 'vivido-media-label vivido-media-fallback';
-      fallback.textContent = element.getAttribute('data-vivido-media-label') ?? mediaType;
+      fallback.textContent = mediaType === 'image' ? '图片暂不可用' : mediaType === 'audio' ? '录音' : '视频';
       content.appendChild(fallback);
     } else if (mediaType === 'image' && isSafePreviewUri(preview.uri)) {
       const image = document.createElement('img');
@@ -127,12 +162,14 @@ const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
       image.src = preview.uri;
       image.alt = preview.label ?? '图片';
       content.appendChild(image);
+      syncNaturalImageSize(image);
     } else if (mediaType === 'video' && isSafePreviewUri(preview.thumbnailUri)) {
       const image = document.createElement('img');
       image.className = 'vivido-media-preview vivido-media-video-preview';
       image.src = preview.thumbnailUri;
       image.alt = preview.label ?? '视频缩略图';
       content.appendChild(image);
+      syncNaturalImageSize(image);
       const badge = document.createElement('span');
       badge.className = 'vivido-media-badge';
       badge.textContent = '视频';
@@ -140,14 +177,10 @@ const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
     } else {
       const fallback = document.createElement('span');
       fallback.className = 'vivido-media-label vivido-media-fallback';
-      fallback.textContent = preview.label ?? (mediaType === 'audio' ? '录音' : '视频');
+      fallback.textContent = mediaType === 'audio' ? '录音' : '视频';
       content.appendChild(fallback);
     }
 
-    const id = document.createElement('span');
-    id.className = 'vivido-media-id';
-    id.textContent = mediaId;
-    content.appendChild(id);
   });
 };
 
@@ -230,24 +263,21 @@ const vividoMediaBridge = new BridgeExtension<
       flex-direction: column; align-items: stretch; gap: 6px;
     }
     .vivido-media-audio .vivido-media-content { flex-direction: row; align-items: center; }
-    .vivido-media-label, .vivido-media-id, .vivido-media-badge { display: inline-block; }
+    .vivido-media-label, .vivido-media-badge { display: inline-block; }
     .vivido-media-label { font-size: 15px; font-weight: 600; }
     .vivido-media-fallback {
       min-height: 48px; padding: 10px 12px; box-sizing: border-box;
       border-radius: 6px; background: rgba(61,44,30,.08); color: currentColor;
     }
-    .vivido-media-id {
-      display: block; min-width: 0; max-width: 100%; font-size: 11px; opacity: .65;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    .vivido-media-preview { display: block; max-width: 100%; object-fit: contain; }
-    .vivido-media-image-preview { width: 100%; max-height: 360px; }
-    .vivido-media-video-preview { width: 100%; max-height: 260px; }
+    .vivido-media-preview { display: block; width: auto; height: auto; max-width: 100%; object-fit: contain; object-position: center; align-self: center; }
+    .vivido-media-image-preview { max-width: 100%; max-height: 360px; }
+    .vivido-media-video-preview { max-width: 100%; max-height: 260px; }
     .vivido-media-badge {
       position: absolute; left: 18px; bottom: 16px; padding: 3px 7px;
       border-radius: 5px; background: rgba(0,0,0,.62); color: #fff; font-size: 14px;
     }
   `,
+  extendEditorState: () => ({ caretRect: readCaretRect() }),
 });
 
 // TenTap 1.0.1 derives the bridge name from tiptapExtension and ignores

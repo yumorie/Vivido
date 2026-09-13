@@ -57,6 +57,30 @@ export const parseMediaLine = (line: string): VividoMediaBlock | null => {
   return null;
 };
 
+/**
+ * Remove only the runtime label/id artifacts emitted by older media atoms.
+ * The match is deliberately adjacent and exact so ordinary user text is not
+ * broadly rewritten during the next canonical save.
+ */
+export const stripMediaRuntimeArtifacts = (markup: string): string => {
+  const lines = markup.replaceAll('\r\n', '\n').split('\n');
+  const cleaned: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const media = parseMediaLine(line);
+    cleaned.push(line);
+    if (!media) continue;
+
+    const label = media.mediaType === 'image' ? '图片' : media.mediaType === 'audio' ? '录音' : '视频';
+    if (lines[index + 1] === `${label}${media.mediaId}`) {
+      index += 1;
+    } else if (lines[index + 1] === label && lines[index + 2] === media.mediaId) {
+      index += 2;
+    }
+  }
+  return cleaned.join('\n');
+};
+
 export const serializeMediaBlock = (block: VividoMediaBlock): string => {
   if (block.mediaType === 'image') {
     return `![${escapeMediaAlt(block.alt ?? '')}](media://${block.mediaId})`;
@@ -65,7 +89,7 @@ export const serializeMediaBlock = (block: VividoMediaBlock): string => {
 };
 
 export const parseMarkupDocument = (markup: string): VividoMarkupBlock[] =>
-  markup.replaceAll('\r\n', '\n').split('\n').map((line) => {
+  stripMediaRuntimeArtifacts(markup).split('\n').map((line) => {
     const media = parseMediaLine(line);
     return media ? media : { kind: 'paragraph', markup: line };
   });
@@ -335,7 +359,7 @@ export const htmlToMarkup = (html: string): string => {
 
   if (paragraphOpen) closeParagraph();
   if (paragraphs.length === 0) paragraphs.push('');
-  return paragraphs.join('\n');
+  return stripMediaRuntimeArtifacts(paragraphs.join('\n'));
 };
 
 export const canonicalizeMarkup = (markup: string): string => htmlToMarkup(markupToHtml(markup));

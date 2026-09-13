@@ -8,6 +8,7 @@ import {
   markupToHtml,
   parseMediaLine,
   parseMarkupDocument,
+  stripMediaRuntimeArtifacts,
 } from '../codec/VividoMarkupCodec.ts';
 
 test('canonicalizes V1 marks and remains stable after reload', () => {
@@ -118,4 +119,38 @@ test('malformed or unsupported media syntax stays ordinary text', () => {
 
   assert.equal(parseMarkupDocument(malformed).every((block) => block.kind === 'paragraph'), true);
   assert.equal(canonicalizeMarkup(malformed), malformed);
+});
+
+test('strips only exact legacy media label/id artifacts', () => {
+  const polluted = [
+    '文本 A',
+    '![测试图片](media://image-test-1)',
+    '图片',
+    'image-test-1',
+    '文本 B',
+    '@[audio](media://audio-test-1)',
+    '录音',
+    'audio-test-1',
+    '文本 C',
+    '@[video](media://video-test-1)',
+    '视频',
+    'video-test-1',
+    '文本 D',
+  ].join('\n');
+  const expected = [
+    '文本 A',
+    '![测试图片](media://image-test-1)',
+    '文本 B',
+    '@[audio](media://audio-test-1)',
+    '文本 C',
+    '@[video](media://video-test-1)',
+    '文本 D',
+  ].join('\n');
+
+  assert.equal(stripMediaRuntimeArtifacts(polluted), expected);
+  assert.equal(canonicalizeMarkup(polluted), expected);
+  assert.equal(
+    stripMediaRuntimeArtifacts('@[video](media://video-test-1)\n视频video-test-2'),
+    '@[video](media://video-test-1)\n视频video-test-2',
+  );
 });
