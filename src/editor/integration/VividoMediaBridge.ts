@@ -1,4 +1,5 @@
 import { BridgeExtension } from '@10play/tentap-editor';
+import { VIVIDO_MEDIA_BRIDGE_NAME } from './VividoMediaContract';
 
 export type VividoMediaType = 'image' | 'audio' | 'video';
 
@@ -18,7 +19,7 @@ export const VividoMediaBridge = new BridgeExtension<
   VividoMediaEditorInstance,
   VividoMediaAction
 >({
-  forceName: 'vividoMedia',
+  forceName: VIVIDO_MEDIA_BRIDGE_NAME,
   extendEditorInstance: (sendBridgeMessage) => ({
     insertImage: (mediaId) =>
       sendBridgeMessage({ type: 'insert-media', payload: { mediaType: 'image', mediaId } }),

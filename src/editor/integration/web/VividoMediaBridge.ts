@@ -6,6 +6,7 @@ import type {
   VividoMediaEditorInstance,
   VividoMediaType,
 } from '../VividoMediaBridge';
+import { VIVIDO_MEDIA_BRIDGE_NAME } from '../VividoMediaContract';
 
 const mediaIdPattern = /^[A-Za-z0-9._~-]+$/;
 
@@ -74,8 +75,12 @@ const audioNode = createMediaNode('audio');
 const videoNode = createMediaNode('video');
 
 const insertMedia = (editor: Editor, mediaType: VividoMediaType, mediaId: string) => {
-  if (!mediaIdPattern.test(mediaId)) return false;
+  if (!['image', 'audio', 'video'].includes(mediaType) || !mediaIdPattern.test(mediaId)) return false;
   const nodeName = `vivido${mediaType[0].toUpperCase()}${mediaType.slice(1)}`;
+  if (!editor.schema.nodes[nodeName]) {
+    console.error(`Vivido media node is not registered: ${nodeName}`);
+    return false;
+  }
   const inserted = editor
     .chain()
     .focus()
@@ -96,12 +101,12 @@ const insertMedia = (editor: Editor, mediaType: VividoMediaType, mediaId: string
   return true;
 };
 
-export const VividoMediaBridge = new BridgeExtension<
+const vividoMediaBridge = new BridgeExtension<
   {},
   VividoMediaEditorInstance,
   VividoMediaAction
 >({
-  forceName: 'vividoMedia',
+  forceName: VIVIDO_MEDIA_BRIDGE_NAME,
   tiptapExtension: imageNode,
   tiptapExtensionDeps: [audioNode, videoNode],
   onBridgeMessage: (editor, message) =>
@@ -123,3 +128,10 @@ export const VividoMediaBridge = new BridgeExtension<
     }
   `,
 });
+
+// TenTap 1.0.1 derives the bridge name from tiptapExtension and ignores
+// forceName when a primary extension is present. Keep the whitelist key equal
+// to the native bridge while retaining the three atom nodes as the extension
+// and its dependencies.
+vividoMediaBridge.name = VIVIDO_MEDIA_BRIDGE_NAME;
+export const VividoMediaBridge = vividoMediaBridge;

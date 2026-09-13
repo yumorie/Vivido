@@ -6,6 +6,7 @@ import {
   StyleSheet,
   TouchableOpacity,
   KeyboardAvoidingView,
+  Keyboard,
   Platform,
   ScrollView,
 } from 'react-native';
@@ -24,13 +25,21 @@ import { AudioRecorder } from '../components/AudioRecorder';
 import { StyledDialog } from '../components/StyledDialog';
 import { assignMediaPositions, getMediaFileExtension, getOrderedMedia } from '../utils/media';
 import { formatDateInputValue, getWeekDayLabel, parseDateInputValue } from '../utils/date';
-import { collectMediaIds, extractPlainText, RichEditorAdapter, RichEditorHost } from '../editor';
+import {
+  collectMediaIds,
+  extractPlainText,
+  RichEditorAdapter,
+  RichEditorHost,
+  RichEditorToolbar,
+  VIVIDO_EDITOR_PAPER_BG,
+} from '../editor';
+import type { RichEditorActiveState } from '../editor';
 import { selectPostCommitCleanupCandidates } from '../editor/mediaLifecycle';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Editor'>;
 type EditorRouteProp = RouteProp<RootStackParamList, 'Editor'>;
 
-const PAPER_BG = '#f5f0e6';
+const PAPER_BG = VIVIDO_EDITOR_PAPER_BG;
 const TEXT_PRIMARY = '#3d2c1e';
 const TEXT_SECONDARY = '#7a6250';
 const TEXT_MUTED = '#a48a74';
@@ -51,6 +60,16 @@ export const EditorScreen: React.FC = () => {
   const [tags, setTags] = useState<Tag[]>([]);
   const [loading, setLoading] = useState(false);
   const [editorReady, setEditorReady] = useState(false);
+  const [editorActiveState, setEditorActiveState] = useState<RichEditorActiveState>({
+    isReady: false,
+    isBoldActive: false,
+    isItalicActive: false,
+    isHighlightActive: false,
+    isFocused: false,
+    canUndo: false,
+    canRedo: false,
+  });
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
   const [editorLoadError, setEditorLoadError] = useState<string | null>(null);
   const [editorMountKey, setEditorMountKey] = useState(0);
   const [entryLoaded, setEntryLoaded] = useState(!isEditing);
@@ -111,6 +130,15 @@ export const EditorScreen: React.FC = () => {
   }, [diaryId]);
 
   useEffect(() => {
+    const showSubscription = Keyboard.addListener('keyboardDidShow', () => setKeyboardVisible(true));
+    const hideSubscription = Keyboard.addListener('keyboardDidHide', () => setKeyboardVisible(false));
+    return () => {
+      showSubscription.remove();
+      hideSubscription.remove();
+    };
+  }, []);
+
+  useEffect(() => {
     if (!entryLoaded || editorReady || editorLoadError) return;
 
     const timeout = setTimeout(() => {
@@ -122,6 +150,7 @@ export const EditorScreen: React.FC = () => {
 
   const retryEditor = () => {
     editorRef.current = null;
+    setEditorActiveState((current) => ({ ...current, isReady: false }));
     setEditorReady(false);
     setEditorLoadError(null);
     setEditorMountKey((current) => current + 1);
@@ -570,7 +599,7 @@ export const EditorScreen: React.FC = () => {
     <SafeAreaView style={styles.mainContainer} edges={['top']}>
       <KeyboardAvoidingView
         style={styles.keyboardView}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         keyboardVerticalOffset={0}
         enabled
       >
@@ -637,8 +666,11 @@ export const EditorScreen: React.FC = () => {
                   key={editorMountKey}
                   ref={editorRef}
                   initialMarkup={content}
+                  showToolbar={false}
+                  onStateChange={setEditorActiveState}
                   onReady={(adapter) => {
                     editorRef.current = adapter;
+                    setEditorActiveState(adapter.getActiveState());
                     setEditorLoadError(null);
                     setEditorReady(true);
                   }}
@@ -711,6 +743,11 @@ export const EditorScreen: React.FC = () => {
 
             <View style={styles.bottomPadding} />
           </ScrollView>
+          {keyboardVisible && editorReady && !editorLoadError && editorActiveState.isFocused && (
+            <View style={styles.keyboardToolbar}>
+              <RichEditorToolbar adapter={editorRef.current} state={editorActiveState} />
+            </View>
+          )}
         </View>
       </KeyboardAvoidingView>
 
@@ -859,6 +896,7 @@ const styles = StyleSheet.create({
   },
   contentContainer: {
     flex: 1,
+    position: 'relative',
   },
   mediaScroll: {
     flex: 1,
@@ -904,7 +942,7 @@ const styles = StyleSheet.create({
     color: '#c4b8ae',
   },
   scrollContentContainer: {
-    paddingBottom: 32,
+    paddingBottom: 100,
   },
   dateRow: {
     flexDirection: 'row',
@@ -928,11 +966,10 @@ const styles = StyleSheet.create({
     fontFamily: 'LXGWWenKaiLite',
   },
   editorArea: {
-    marginHorizontal: 16,
-    padding: 20,
-    borderTopWidth: 1,
-    borderBottomWidth: 1,
-    borderColor: 'rgba(196, 112, 48, 0.12)',
+    paddingTop: 8,
+    paddingHorizontal: 0,
+    paddingBottom: 0,
+    backgroundColor: PAPER_BG,
   },
   titleInput: {
     fontSize: 22,
@@ -1018,5 +1055,17 @@ const styles = StyleSheet.create({
   },
   bottomPadding: {
     height: 40,
+  },
+  keyboardToolbar: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingHorizontal: 12,
+    paddingTop: 6,
+    paddingBottom: 6,
+    backgroundColor: PAPER_BG,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(196, 112, 48, 0.12)',
   },
 });

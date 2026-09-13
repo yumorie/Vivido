@@ -12,9 +12,10 @@ import {
   useEditorBridge,
 } from '@10play/tentap-editor';
 import type { EditorBridge } from '@10play/tentap-editor';
-import type { RichEditorAdapter } from './RichEditorAdapter';
+import type { RichEditorActiveState, RichEditorAdapter } from './RichEditorAdapter';
 import { createRichEditorAdapter, updateRichEditorActiveState } from './RichEditorAdapter';
-import { VIVIDO_HIGHLIGHT_COLOR } from './codec/VividoMarkupCodec';
+import { markupToHtml, VIVIDO_HIGHLIGHT_COLOR } from './codec/VividoMarkupCodec';
+import { VIVIDO_EDITOR_PAPER_BG } from './editorTheme';
 import { alpha, colors, typography } from '../theme';
 import { VividoMediaBridge } from './integration/VividoMediaBridge';
 import type { VividoMediaEditorInstance } from './integration/VividoMediaBridge';
@@ -24,12 +25,16 @@ export interface RichEditorHostProps {
   initialMarkup: string;
   onReady?: (adapter: RichEditorAdapter) => void;
   onDirty?: () => void;
+  onStateChange?: (state: Readonly<RichEditorActiveState>) => void;
+  showToolbar?: boolean;
 }
 
 export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>(
-  function RichEditorHost({ initialMarkup, onReady, onDirty }, ref) {
+  function RichEditorHost({ initialMarkup, onReady, onDirty, onStateChange, showToolbar = true }, ref) {
     const onDirtyRef = useRef(onDirty);
     onDirtyRef.current = onDirty;
+    const onStateChangeRef = useRef(onStateChange);
+    onStateChangeRef.current = onStateChange;
     const controlledLoadGenerationRef = useRef<number | null>(null);
     const onChange = useCallback(() => {
       if (controlledLoadGenerationRef.current !== null) {
@@ -41,13 +46,23 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
       () => [CoreBridge, BoldBridge, ItalicBridge, HighlightBridge, HistoryBridge, HardBreakBridge, VividoMediaBridge],
       [],
     );
+    const editorTheme = useMemo(
+      () => ({
+        webview: { backgroundColor: VIVIDO_EDITOR_PAPER_BG },
+        webviewContainer: { backgroundColor: VIVIDO_EDITOR_PAPER_BG },
+      }),
+      [],
+    );
     const editor = useEditorBridge({
       autofocus: true,
       avoidIosKeyboard: true,
-      initialContent: '<p></p>',
+      // The first WebView document is created with the current markup. Later
+      // changes (draft restore/retry) still use the controlled load path below.
+      initialContent: markupToHtml(initialMarkup),
       bridgeExtensions,
       customSource: VIVIDO_MEDIA_EDITOR_SOURCE,
       onChange,
+      theme: editorTheme,
     });
     const editorState = useBridgeState(editor);
     const editorStateRef = useRef(editorState);
@@ -68,12 +83,17 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
     const confirmedMarkupRef = useRef<string | null>(null);
     const confirmedReadyRef = useRef(false);
     const mountedRef = useRef(true);
+    const initialContentConfirmedRef = useRef(false);
+    // Only skip the first controlled load when it matches what this WebView
+    // mount actually received through useEditorBridge(initialContent).
+    const mountedInitialMarkupRef = useRef(initialMarkup);
 
     useEffect(() => () => {
       mountedRef.current = false;
       loadGenerationRef.current += 1;
       controlledLoadGenerationRef.current = null;
       confirmedReadyRef.current = false;
+      initialContentConfirmedRef.current = false;
     }, []);
 
     useImperativeHandle(ref, () => adapter, [adapter]);
@@ -91,6 +111,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
         canUndo: Boolean(editorState.canUndo),
         canRedo: Boolean(editorState.canRedo),
       });
+      onStateChangeRef.current?.(adapter.getActiveState());
     }, [adapter, editorState, initialMarkup]);
 
     const loadAndConfirmMarkup = useCallback(async (markup: string) => {
@@ -109,7 +130,11 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
         canUndo: Boolean(currentState.canUndo),
         canRedo: Boolean(currentState.canRedo),
       });
-      adapter.load(markup);
+      const usesInjectedInitialContent =
+        !initialContentConfirmedRef.current && mountedInitialMarkupRef.current === markup;
+      if (!usesInjectedInitialContent) {
+        adapter.load(markup);
+      }
 
       try {
         // TenTap queues bridge messages. Reading immediately after setContent
@@ -125,6 +150,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
         controlledLoadGenerationRef.current = null;
         confirmedMarkupRef.current = markup;
         confirmedReadyRef.current = true;
+        initialContentConfirmedRef.current = true;
         const confirmedState = editorStateRef.current;
         updateRichEditorActiveState(adapter, {
           isReady: Boolean(confirmedState.isReady),
@@ -172,7 +198,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
           {/* RichText stays mounted for the complete editor session. */}
           <RichText editor={editor} style={styles.richText} />
         </View>
-        <View style={styles.toolbar}>
+        {showToolbar && <View style={styles.toolbar}>
           {button('B', () => adapter.toggleBold(), Boolean(editorState.isBoldActive))}
           {button('I', () => adapter.toggleItalic(), Boolean(editorState.isItalicActive))}
           {button(
@@ -182,22 +208,59 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
           )}
           {button('Undo', () => adapter.undo(), false, !editorState.canUndo)}
           {button('Redo', () => adapter.redo(), false, !editorState.canRedo)}
-        </View>
+        </View>}
       </View>
     );
   },
 );
 
+export interface RichEditorToolbarProps {
+  adapter: RichEditorAdapter | null;
+  state: Readonly<RichEditorActiveState>;
+}
+
+/** Native controls rendered outside the WebView, immediately above the IME. */
+export const RichEditorToolbar: React.FC<RichEditorToolbarProps> = ({ adapter, state }) => {
+  const button = useMemo(
+    () => (label: string, onPress: () => void, active = false, disabled = false) => (
+      <Pressable
+        key={label}
+        accessibilityRole="button"
+        accessibilityState={{ disabled }}
+        disabled={disabled}
+        style={[styles.button, active && styles.activeButton, disabled && styles.disabledButton]}
+        onPress={onPress}
+      >
+        <Text style={styles.buttonText}>{label}</Text>
+      </Pressable>
+    ),
+    [],
+  );
+
+  return (
+    <View style={styles.toolbar}>
+      {button('B', () => adapter?.toggleBold(), state.isBoldActive, !adapter || !state.isReady)}
+      {button('I', () => adapter?.toggleItalic(), state.isItalicActive, !adapter || !state.isReady)}
+      {button(
+        `Highlight ${state.isHighlightActive ? '●' : '○'}`,
+        () => adapter?.toggleHighlight(),
+        state.isHighlightActive,
+        !adapter || !state.isReady,
+      )}
+      {button('Undo', () => adapter?.undo(), false, !adapter || !state.isReady || !state.canUndo)}
+      {button('Redo', () => adapter?.redo(), false, !adapter || !state.isReady || !state.canRedo)}
+    </View>
+  );
+};
+
 const styles = StyleSheet.create({
   host: { width: '100%' },
   editorFrame: {
     minHeight: 220,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: alpha(colors.primary, 0.12),
+    backgroundColor: VIVIDO_EDITOR_PAPER_BG,
     overflow: 'hidden',
   },
-  richText: { minHeight: 220, flex: 1 },
+  richText: { minHeight: 220, flex: 1, backgroundColor: VIVIDO_EDITOR_PAPER_BG },
   toolbar: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingTop: 10 },
   button: {
     backgroundColor: alpha(colors.primary, 0.08),

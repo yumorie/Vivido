@@ -15,6 +15,9 @@ const assetMatch = html.match(assetPattern);
 if (!assetMatch) throw new Error('Vivido custom editor build did not emit a script asset');
 const scriptPath = resolve(outputDir, assetMatch[1].replace(/^\//, ''));
 const script = await readFile(scriptPath, 'utf8');
+if (!script.includes('vividoMedia')) {
+  throw new Error('Vivido media bridge name was not included in the custom editor source');
+}
 html = html.replace(assetMatch[0], () => `<script type="module">${script}</script>`);
 
 await mkdir(generatedDir, { recursive: true });

@@ -9,12 +9,35 @@
     <div id="root"></div>
     <script type="module" src="./index.tsx"></script>
     <style>
-      body { margin: 0; padding: 0; }
+      /* Must match VIVIDO_EDITOR_PAPER_BG (#f5f0e6) used by the RN editor frame. */
+      :root, html, body, #root { margin: 0; padding: 0; background: #f5f0e6; }
+      body {
+        color: #3d2c1e;
+        font-family: system-ui, -apple-system, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+        font-size: 16px;
+        line-height: 1.65;
+        font-weight: 400;
+      }
       #root > div:nth-of-type(1) {
         position: absolute; height: 100%; overflow: auto; width: 100%; top: 0; bottom: 0;
+        background: #f5f0e6;
       }
       #root > div.dynamic-height { height: unset; }
-      #root div .ProseMirror { min-height: 100%; overflow: visible; }
+      #root div .ProseMirror {
+        min-height: 100%;
+        overflow: visible;
+        box-sizing: border-box;
+        padding: 12px 16px 24px;
+        color: #3d2c1e;
+        background: transparent;
+        font: inherit;
+        font-weight: 400;
+      }
+      #root div .ProseMirror p { margin: 0 0 8px; }
+      #root div .ProseMirror p:last-child { margin-bottom: 0; }
+      #root div .ProseMirror strong { font-weight: 700; }
+      #root div .ProseMirror em { font-style: italic; }
+      #root div .ProseMirror mark { background: #fff2a8; color: inherit; }
       #root div.dynamic-height .ProseMirror { height: unset; }
       .ProseMirror:focus { outline: none; }
     </style>
