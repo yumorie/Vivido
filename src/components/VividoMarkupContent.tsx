@@ -50,10 +50,8 @@ const VisualMedia = ({ item }: { item: MediaItem }) => {
   return (
     <VideoPoster
       thumbnailUri={item.thumbnail}
-      videoUri={item.uri}
       style={[styles.video, { aspectRatio }]}
       label="视频"
-      enableGeneratedThumbnail={!item.thumbnail}
       onAspectRatioChange={updateAspectRatio}
     />
   );

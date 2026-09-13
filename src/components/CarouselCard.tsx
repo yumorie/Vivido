@@ -50,8 +50,6 @@ export const CarouselCard: React.FC<CarouselCardProps> = ({ diary, width, onPres
             isVideoCover ? (
               <VideoPoster
                 thumbnailUri={cover.thumbnail}
-                videoUri={cover.uri}
-                enableGeneratedThumbnail
                 style={styles.media}
               />
             ) : isAudioCover ? (

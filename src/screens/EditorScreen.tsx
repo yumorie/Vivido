@@ -7,12 +7,15 @@ import {
   TouchableOpacity,
   KeyboardAvoidingView,
   Keyboard,
+  AppState,
+  Dimensions,
   Platform,
   ScrollView,
+  StatusBar,
 } from 'react-native';
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 import type { ImageManipulatorContext, ImageRef } from 'expo-image-manipulator';
@@ -43,6 +46,17 @@ import { selectPostCommitCleanupCandidates } from '../editor/mediaLifecycle';
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, 'Editor'>;
 type EditorRouteProp = RouteProp<RootStackParamList, 'Editor'>;
+type KeyboardPhase = 'hidden' | 'visible';
+type PendingReveal = {
+  kind: 'caret' | 'tag';
+  top: number;
+  bottom: number;
+};
+type KeyboardTraceEvent = { endCoordinates: { screenY: number; height: number } };
+
+// Kept as an opt-in diagnostic for future device investigations. Production
+// and normal development runs must not collect, render, or log keyboard traces.
+const KEYBOARD_TRACE_ENABLED = false;
 
 const PAPER_BG = VIVIDO_EDITOR_PAPER_BG;
 const TEXT_PRIMARY = '#3d2c1e';
@@ -72,9 +86,55 @@ const deleteTransientPreview = async (uri: string): Promise<void> => {
   }
 };
 
+/**
+ * Materialize one video frame in the existing media directory. The returned
+ * URI is business media metadata; the intermediate cache URI is never exposed
+ * to markup and is removed after the copy completes.
+ */
+const createPersistentVideoThumbnail = async (item: MediaItem): Promise<MediaItem | null> => {
+  if (item.thumbnail) return item;
+  let player: ReturnType<typeof createVideoPlayer> | null = null;
+  let thumbnail: SharedRefType<'image'> | null = null;
+  let context: ImageManipulatorContext | null = null;
+  let imageRef: ImageRef | null = null;
+  let cacheUri: string | null = null;
+  try {
+    player = createVideoPlayer(item.uri);
+    const thumbnails = await player.generateThumbnailsAsync([0.1], {
+      maxWidth: 1200,
+      maxHeight: 1200,
+    });
+    thumbnail = thumbnails[0] ?? null;
+    if (!thumbnail) return null;
+
+    context = ImageManipulator.manipulate(thumbnail);
+    imageRef = await context.renderAsync();
+    const result = await imageRef.saveAsync({
+      format: SaveFormat.JPEG,
+      base64: false,
+      compress: 0.82,
+    });
+    cacheUri = result.uri;
+    const stableThumbnailUri = await saveMedia(cacheUri, `${item.id}.thumb.jpg`);
+    await deleteTransientPreview(cacheUri);
+    cacheUri = null;
+    return { ...item, thumbnail: stableThumbnailUri };
+  } catch (error) {
+    console.warn(`Failed to persist video thumbnail for ${item.id}:`, error);
+    return null;
+  } finally {
+    releaseNativeRef(imageRef);
+    releaseNativeRef(context);
+    releaseNativeRef(thumbnail);
+    releaseNativeRef(player);
+    if (cacheUri) void deleteTransientPreview(cacheUri);
+  }
+};
+
 export const EditorScreen: React.FC = () => {
   const navigation = useNavigation<NavigationProp>();
   const route = useRoute<EditorRouteProp>();
+  const insets = useSafeAreaInsets();
   const diaryId = route.params?.diaryId;
   const isEditing = !!diaryId;
 
@@ -95,14 +155,16 @@ export const EditorScreen: React.FC = () => {
     canRedo: false,
     caretRect: null,
   });
-  const [keyboardVisible, setKeyboardVisible] = useState(() => Keyboard.isVisible());
-  const [editorInputFocused, setEditorInputFocused] = useState(false);
+  const [keyboardPhase, setKeyboardPhase] = useState<KeyboardPhase>(() =>
+    Keyboard.isVisible() ? 'visible' : 'hidden',
+  );
+  const [debugKeyboardTrace, setDebugKeyboardTrace] = useState<string | null>(null);
+  const [debugKeyboardTraceVisible, setDebugKeyboardTraceVisible] = useState(false);
+  const [debugKeyboardTraceTitle, setDebugKeyboardTraceTitle] = useState('VIVIDO_KEYBOARD_TRACE');
   const [editorLoadError, setEditorLoadError] = useState<string | null>(null);
   const [editorMountKey, setEditorMountKey] = useState(0);
   const [entryLoaded, setEntryLoaded] = useState(!isEditing);
   const [contentLength, setContentLength] = useState(0);
-  const [runtimeVideoPreviews, setRuntimeVideoPreviews] = useState<Record<string, string>>({});
-  const [videoPreviewWake, setVideoPreviewWake] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [originalMedia, setOriginalMedia] = useState<MediaItem[]>([]);
   const [initialCreatedAt, setInitialCreatedAt] = useState(Date.now());
@@ -144,73 +206,549 @@ export const EditorScreen: React.FC = () => {
   const manualSaveRef = useRef(false);
   const editorMediaIdsRef = useRef<Set<string>>(new Set());
   const stagedMediaRef = useRef<MediaItem[]>([]);
+  const mediaRef = useRef(media);
+  mediaRef.current = media;
+  const videoThumbnailTasksRef = useRef(new Map<string, Promise<MediaItem | null>>());
+  const videoThumbnailQueueRef = useRef<Array<{
+    item: MediaItem;
+    resolve: (result: MediaItem | null) => void;
+  }>>([]);
+  const videoThumbnailWorkerRef = useRef(false);
+  const videoThumbnailFailedRef = useRef(new Set<string>());
+  // Thumbnails generated for an existing media row are staged derivatives;
+  // they must never make the original video itself look newly staged.
+  const generatedThumbnailDerivativesRef = useRef(new Map<string, string>());
+  const originalMediaRef = useRef<MediaItem[]>([]);
   const editorInputOwnerRef = useRef<'editor' | 'other' | null>(null);
-  const runtimeVideoPreviewsRef = useRef(new Map<string, string>());
-  const generatedVideoPreviewUrisRef = useRef(new Map<string, string>());
-  const generatedVideoPreviewSourcesRef = useRef(new Map<string, string>());
-  const attemptedVideoPreviewIdsRef = useRef(new Set<string>());
-  const failedVideoPreviewIdsRef = useRef(new Set<string>());
-  const videoPreviewWorkerRef = useRef<Promise<void> | null>(null);
-  const observedVideoPreviewWorkerRef = useRef<Promise<void> | null>(null);
-  const editorReadyRef = useRef(editorReady);
-  const videoPreviewGenerationRef = useRef(0);
   const mountedRef = useRef(true);
   const editorScrollRef = useRef<ScrollView | null>(null);
   const editorAreaTopRef = useRef(0);
   const editorHostTopRef = useRef(0);
+  const tagEditorTopRef = useRef(0);
+  const tagInputBottomRef = useRef<number | null>(null);
+  const tagInputFocusedRef = useRef(false);
+  const caretEnsureFrameRef = useRef<number | null>(null);
+  const latestCaretRectRef = useRef<RichEditorActiveState['caretRect']>(editorActiveState.caretRect);
+  const scrollContentHeightRef = useRef(0);
+  const pendingRevealRef = useRef<PendingReveal | null>(null);
+  const manualScrollActiveRef = useRef(false);
+  const suppressRevealAfterManualScrollRef = useRef(false);
+  const lastCaretGeometryRef = useRef<{ top: number; bottom: number } | null>(null);
+  const inputRevealRequestedRef = useRef(false);
+  const lastRevealCommandRef = useRef<{
+    kind: PendingReveal['kind'];
+    target: number;
+    contentHeight: number;
+    viewportHeight: number;
+  } | null>(null);
   const scrollOffsetRef = useRef(0);
   const scrollViewportHeightRef = useRef(0);
   const keyboardToolbarHeightRef = useRef(0);
-
+  const keyboardPhaseRef = useRef<KeyboardPhase>(Keyboard.isVisible() ? 'visible' : 'hidden');
+  const keyboardBaselineHeightRef = useRef<number | null>(null);
+  const keyboardCurrentHeightRef = useRef(0);
+  const keyboardHiddenEvidenceRef = useRef(!Keyboard.isVisible());
+  const keyboardFullHeightStableCountRef = useRef(0);
+  const keyboardPositiveEvidenceRef = useRef(Keyboard.isVisible());
+  const keyboardHidePendingRef = useRef(false);
+  const keyboardToolbarFrameRef = useRef<number | null>(null);
+  const keyboardToolbarGenerationRef = useRef(0);
+  const foregroundRecoveryGenerationRef = useRef(0);
+  const foregroundRecoveryActiveRef = useRef(false);
+  const foregroundRecoveryKeepToolbarRef = useRef(false);
+  // App backgrounding must sever retained WebView DOM focus. This intent is
+  // derived only from confirmed keyboard evidence before the transition.
+  const editorKeyboardReturnIntentRef = useRef(false);
+  // AppState.currentState may be null during Expo/RN cold start. Unknown is
+  // not evidence that this mounted editor is backgrounded.
+  const lifecycleInactiveRef = useRef(false);
+  const lifecycleBlurSentRef = useRef(false);
+  const lifecycleBlurGenerationRef = useRef(0);
+  const lifecycleBlurPendingRef = useRef(false);
+  const lifecycleBlurAckRef = useRef(false);
+  const resumeFocusGenerationRef = useRef(0);
+  const resumeFocusSentRef = useRef(false);
+  // In pan/no-repeat-didShow environments, a confirmed TenTap focus during
+  // controlled resume is still positive evidence for the editor session.
+  const resumeBridgeFocusEvidenceRef = useRef(false);
+  const resumeFocusFrameRef = useRef<number | null>(null);
+  const resumeWindowFocusFrameRef = useRef<number | null>(null);
+  const resumeFocusFallbackTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const resumeFocusDeadlineTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const appStateRef = useRef(AppState.currentState ?? 'active');
+  const lifecycleEventRingRef = useRef<string[]>([]);
+  const lifecycleTraceStartedAtRef = useRef<number | null>(null);
+  const lifecycleTraceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const coldKeyboardTraceCapturedRef = useRef(false);
+  const coldKeyboardTraceGenerationRef = useRef(0);
+  const coldKeyboardTraceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const debugKeyboardTraceTitleRef = useRef('VIVIDO_KEYBOARD_TRACE');
+  const debugKeyboardTraceVisibleRef = useRef(false);
+  const editorReadyRef = useRef(editorReady);
+  const editorRootRef = useRef<View | null>(null);
+  const keyboardAvoidingViewRef = useRef<KeyboardAvoidingView | null>(null);
+  const keyboardToolbarRef = useRef<View | null>(null);
+  const safeAreaTopRef = useRef(insets.top);
+  const windowScreenTopRef = useRef(Platform.OS === 'android' ? (StatusBar.currentHeight ?? 0) : 0);
+  const keyboardAvoidingOffsetRef = useRef(
+    Platform.OS === 'android'
+      ? Math.max((StatusBar.currentHeight ?? 0) - insets.top, 0)
+      : 0,
+  );
+  safeAreaTopRef.current = insets.top;
+  windowScreenTopRef.current = Platform.OS === 'android' ? (StatusBar.currentHeight ?? 0) : 0;
+  keyboardAvoidingOffsetRef.current = Platform.OS === 'android'
+    ? Math.max((StatusBar.currentHeight ?? 0) - insets.top, 0)
+    : 0;
   editorReadyRef.current = editorReady;
+  latestCaretRectRef.current = editorActiveState.caretRect;
+
+  const recordLifecycleEvent = useCallback((event: string) => {
+    if (!__DEV__ || !KEYBOARD_TRACE_ENABLED) return;
+    const metricsHeight = typeof Keyboard.metrics === 'function' ? (Keyboard.metrics()?.height ?? 0) : 0;
+    const startedAt = lifecycleTraceStartedAtRef.current ?? Date.now();
+    const snapshot = `+${Date.now() - startedAt}ms ${event}|app=${appStateRef.current}|phase=${keyboardPhaseRef.current}|owner=${editorInputOwnerRef.current ?? 'none'}|intent=${editorKeyboardReturnIntentRef.current ? 1 : 0}|positive=${keyboardPositiveEvidenceRef.current ? 1 : 0}|hidePending=${keyboardHidePendingRef.current ? 1 : 0}|inactive=${lifecycleInactiveRef.current ? 1 : 0}|blurPending=${lifecycleBlurPendingRef.current ? 1 : 0}|blurAck=${lifecycleBlurAckRef.current ? 1 : 0}|resumeSent=${resumeFocusSentRef.current ? 1 : 0}|bridgeEvidence=${resumeBridgeFocusEvidenceRef.current ? 1 : 0}|ime=${Keyboard.isVisible() ? 1 : 0}|metrics=${Math.round(metricsHeight)}|baseline=${keyboardBaselineHeightRef.current === null ? 'null' : Math.round(keyboardBaselineHeightRef.current)}|root=${Math.round(keyboardCurrentHeightRef.current)}`;
+    const ring = lifecycleEventRingRef.current;
+    ring.push(snapshot);
+    if (ring.length > 32) ring.shift();
+  }, []);
+
+  const scheduleLifecycleTraceSummary = useCallback(() => {
+    if (!__DEV__ || !KEYBOARD_TRACE_ENABLED || lifecycleTraceTimerRef.current !== null) return;
+    lifecycleTraceStartedAtRef.current = Date.now();
+    lifecycleEventRingRef.current = [];
+    if (!(debugKeyboardTraceTitleRef.current === 'VIVIDO_COLD_KEYBOARD_TRACE'
+      && debugKeyboardTraceVisibleRef.current)) {
+      debugKeyboardTraceTitleRef.current = 'VIVIDO_KEYBOARD_TRACE';
+      debugKeyboardTraceVisibleRef.current = false;
+      setDebugKeyboardTrace(null);
+      setDebugKeyboardTraceTitle('VIVIDO_KEYBOARD_TRACE');
+      setDebugKeyboardTraceVisible(false);
+    }
+    recordLifecycleEvent('foreground-recovery-start');
+    lifecycleTraceTimerRef.current = setTimeout(() => {
+      lifecycleTraceTimerRef.current = null;
+      recordLifecycleEvent('foreground-recovery-settle');
+      // Freeze the string before logging so LogBox inspection cannot observe
+      // a later mutation of the ring or alter editor focus/keyboard state.
+      const summary = lifecycleEventRingRef.current.join(' <- ');
+      if (!(debugKeyboardTraceTitleRef.current === 'VIVIDO_COLD_KEYBOARD_TRACE'
+        && debugKeyboardTraceVisibleRef.current)) {
+        debugKeyboardTraceTitleRef.current = 'VIVIDO_KEYBOARD_TRACE';
+        debugKeyboardTraceVisibleRef.current = true;
+        setDebugKeyboardTraceTitle('VIVIDO_KEYBOARD_TRACE');
+        setDebugKeyboardTrace(summary);
+        setDebugKeyboardTraceVisible(true);
+      }
+      console.warn(`VIVIDO_KEYBOARD_TRACE ${summary}`);
+      lifecycleTraceStartedAtRef.current = null;
+    }, 2300);
+  }, [recordLifecycleEvent]);
+
+  const scheduleColdKeyboardTrace = useCallback((event: KeyboardTraceEvent) => {
+    if (!__DEV__ || !KEYBOARD_TRACE_ENABLED || coldKeyboardTraceCapturedRef.current || lifecycleInactiveRef.current
+      || appStateRef.current !== 'active' || editorInputOwnerRef.current !== 'editor') return;
+    coldKeyboardTraceCapturedRef.current = true;
+    coldKeyboardTraceGenerationRef.current += 1;
+    const generation = coldKeyboardTraceGenerationRef.current;
+    if (coldKeyboardTraceTimerRef.current !== null) {
+      clearTimeout(coldKeyboardTraceTimerRef.current);
+    }
+    const measure = (ref: unknown) => new Promise<{ x: number; y: number; width: number; height: number } | null>((resolve) => {
+      const measurable = ref as { measureInWindow?: (callback: (x: number, y: number, width: number, height: number) => void) => void } | null;
+      if (!measurable?.measureInWindow) {
+        resolve(null);
+        return;
+      }
+      measurable.measureInWindow((x, y, width, height) => resolve({ x, y, width, height }));
+    });
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      coldKeyboardTraceTimerRef.current = setTimeout(async () => {
+        coldKeyboardTraceTimerRef.current = null;
+        if (!mountedRef.current || generation !== coldKeyboardTraceGenerationRef.current
+          || lifecycleInactiveRef.current || appStateRef.current !== 'active') return;
+        const [kav, root, scroll, toolbar] = await Promise.all([
+          measure(keyboardAvoidingViewRef.current),
+          measure(editorRootRef.current),
+          measure(editorScrollRef.current),
+          measure(keyboardToolbarRef.current),
+        ]);
+        if (!mountedRef.current || generation !== coldKeyboardTraceGenerationRef.current) return;
+        const windowSize = Dimensions.get('window');
+        const screenSize = Dimensions.get('screen');
+        const keyboardTop = event.endCoordinates.screenY;
+        const safeTop = safeAreaTopRef.current;
+        const windowScreenTop = windowScreenTopRef.current;
+        const toolbarBottomRaw = toolbar ? toolbar.y + toolbar.height : null;
+        const toolbarBottomScreen = toolbarBottomRaw === null ? null : toolbarBottomRaw + windowScreenTop;
+        const overlap = toolbarBottomScreen === null ? null : toolbarBottomScreen - keyboardTop;
+        const keyboardMetrics = typeof Keyboard.metrics === 'function' ? Keyboard.metrics() : undefined;
+        const metricsHeight = keyboardMetrics?.height ?? 0;
+        const metricsScreenY = keyboardMetrics?.screenY ?? null;
+        const fmt = (value: { x: number; y: number; width: number; height: number } | null) => value
+          ? `${Math.round(value.x)},${Math.round(value.y)},${Math.round(value.width)}x${Math.round(value.height)}`
+          : 'null';
+        const summary = [
+          `event=screenY:${Math.round(keyboardTop)},height:${Math.round(event.endCoordinates.height)}`,
+          `metricsY=${metricsScreenY === null ? 'null' : Math.round(metricsScreenY)},metricsH=${Math.round(metricsHeight)},window=${Math.round(windowSize.width)}x${Math.round(windowSize.height)},screen=${Math.round(screenSize.width)}x${Math.round(screenSize.height)}`,
+          `kav(x,y,w,h)=${fmt(kav)},root=${fmt(root)},scroll=${fmt(scroll)},toolbar=${fmt(toolbar)}`,
+          `safeTop=${Math.round(safeTop)},statusBarHeight=${Math.round(windowScreenTop)},toolbarBottomWindow=${toolbarBottomRaw === null ? 'null' : Math.round(toolbarBottomRaw)},toolbarBottomScreen=${toolbarBottomScreen === null ? 'null' : Math.round(toolbarBottomScreen)},keyboardTop=${Math.round(keyboardTop)},overlapPx=${overlap === null ? 'null' : Math.round(overlap)}`,
+          `offset=${Math.round(keyboardAvoidingOffsetRef.current)},phase=${keyboardPhaseRef.current},baseline=${keyboardBaselineHeightRef.current === null ? 'null' : Math.round(keyboardBaselineHeightRef.current)},currentRoot=${Math.round(keyboardCurrentHeightRef.current)}`,
+        ].join('\n');
+        debugKeyboardTraceTitleRef.current = 'VIVIDO_COLD_KEYBOARD_TRACE';
+        debugKeyboardTraceVisibleRef.current = true;
+        setDebugKeyboardTraceTitle('VIVIDO_COLD_KEYBOARD_TRACE');
+        setDebugKeyboardTrace(summary);
+        setDebugKeyboardTraceVisible(true);
+      }, 150);
+    }));
+  }, []);
+
+  const setKeyboardPhaseStable = useCallback((next: KeyboardPhase) => {
+    keyboardPhaseRef.current = next;
+    setKeyboardPhase((current) => (current === next ? current : next));
+  }, []);
+
+  const revealKeyboardToolbarAfterLayout = useCallback(() => {
+    if (keyboardPhaseRef.current === 'visible') return;
+    keyboardToolbarGenerationRef.current += 1;
+    const generation = keyboardToolbarGenerationRef.current;
+    if (keyboardToolbarFrameRef.current !== null) {
+      cancelAnimationFrame(keyboardToolbarFrameRef.current);
+    }
+    keyboardToolbarFrameRef.current = requestAnimationFrame(() => {
+      // KAV's didShow handler performs an async state update. A second frame
+      // lets that commit and the resulting flex layout settle before adding
+      // the normal toolbar sibling.
+      keyboardToolbarFrameRef.current = requestAnimationFrame(() => {
+        keyboardToolbarFrameRef.current = null;
+        if (generation === keyboardToolbarGenerationRef.current
+          && editorInputOwnerRef.current === 'editor'
+          && keyboardPositiveEvidenceRef.current) {
+          setKeyboardPhaseStable('visible');
+        }
+      });
+    });
+  }, [setKeyboardPhaseStable]);
+
+  const cancelResumeEditorFocus = useCallback(() => {
+    resumeFocusGenerationRef.current += 1;
+    resumeFocusSentRef.current = false;
+    if (resumeFocusFrameRef.current !== null) {
+      cancelAnimationFrame(resumeFocusFrameRef.current);
+      resumeFocusFrameRef.current = null;
+    }
+    if (resumeWindowFocusFrameRef.current !== null) {
+      cancelAnimationFrame(resumeWindowFocusFrameRef.current);
+      resumeWindowFocusFrameRef.current = null;
+    }
+    if (resumeFocusFallbackTimerRef.current !== null) {
+      clearTimeout(resumeFocusFallbackTimerRef.current);
+      resumeFocusFallbackTimerRef.current = null;
+    }
+    if (resumeFocusDeadlineTimerRef.current !== null) {
+      clearTimeout(resumeFocusDeadlineTimerRef.current);
+      resumeFocusDeadlineTimerRef.current = null;
+    }
+  }, []);
+
+  const confirmResumeEditorFocus = useCallback(() => {
+    if (lifecycleBlurPendingRef.current && !lifecycleBlurAckRef.current) return;
+    const wasRecovering = foregroundRecoveryActiveRef.current || resumeFocusSentRef.current;
+    cancelResumeEditorFocus();
+    foregroundRecoveryActiveRef.current = false;
+    foregroundRecoveryKeepToolbarRef.current = false;
+    if (wasRecovering && __DEV__) {
+      recordLifecycleEvent('resume-confirm');
+    }
+  }, [cancelResumeEditorFocus, recordLifecycleEvent]);
+
+  const attemptResumeEditorFocus = useCallback(() => {
+    if (
+      !editorKeyboardReturnIntentRef.current ||
+      editorInputOwnerRef.current !== 'editor' ||
+      appStateRef.current !== 'active' ||
+      resumeFocusSentRef.current ||
+      (lifecycleBlurPendingRef.current && !lifecycleBlurAckRef.current) ||
+      !editorReadyRef.current ||
+      !editorRef.current
+    ) return;
+
+    const generation = resumeFocusGenerationRef.current;
+    const lifecycleGeneration = lifecycleBlurGenerationRef.current;
+    resumeFocusSentRef.current = true;
+    if (resumeFocusFallbackTimerRef.current !== null) {
+      clearTimeout(resumeFocusFallbackTimerRef.current);
+      resumeFocusFallbackTimerRef.current = null;
+    }
+    // Reserve the normal toolbar sibling before asking Android to reconnect
+    // the IME. Visibility is still confirmed only by didShow/resize/metrics.
+    setKeyboardPhaseStable('visible');
+    resumeFocusFrameRef.current = requestAnimationFrame(() => {
+      resumeFocusFrameRef.current = null;
+      if (
+        generation === resumeFocusGenerationRef.current &&
+        lifecycleGeneration === lifecycleBlurGenerationRef.current &&
+        editorKeyboardReturnIntentRef.current &&
+        editorInputOwnerRef.current === 'editor' &&
+        appStateRef.current === 'active'
+      ) {
+        editorRef.current?.focus();
+      }
+    });
+  }, [setKeyboardPhaseStable]);
+
+  const beginResumeEditorFocus = useCallback(() => {
+    if (
+      !editorKeyboardReturnIntentRef.current ||
+      editorInputOwnerRef.current !== 'editor' ||
+      appStateRef.current !== 'active'
+    ) return;
+
+    cancelResumeEditorFocus();
+    resumeBridgeFocusEvidenceRef.current = false;
+    const generation = resumeFocusGenerationRef.current;
+    foregroundRecoveryActiveRef.current = true;
+    foregroundRecoveryKeepToolbarRef.current = true;
+    // The toolbar is intentionally hidden until the window-focus handoff (or
+    // the bounded fallback) starts the controlled restore.
+    setKeyboardPhaseStable('hidden');
+    resumeFocusFallbackTimerRef.current = setTimeout(() => {
+      resumeFocusFallbackTimerRef.current = null;
+      if (generation === resumeFocusGenerationRef.current) attemptResumeEditorFocus();
+    }, 250);
+    resumeFocusDeadlineTimerRef.current = setTimeout(() => {
+      resumeFocusDeadlineTimerRef.current = null;
+      if (generation !== resumeFocusGenerationRef.current || !editorKeyboardReturnIntentRef.current) return;
+      if (lifecycleBlurPendingRef.current && !lifecycleBlurAckRef.current) {
+        // The WebView may have been paused before its queued blur was
+        // delivered. Give that command one bounded handoff opportunity rather
+        // than racing it with focus; the next frame is the only fallback.
+        lifecycleBlurPendingRef.current = false;
+        lifecycleBlurAckRef.current = true;
+        requestAnimationFrame(() => attemptResumeEditorFocus());
+        resumeFocusDeadlineTimerRef.current = setTimeout(() => {
+          if (
+            generation === resumeFocusGenerationRef.current &&
+            editorKeyboardReturnIntentRef.current &&
+            !keyboardPositiveEvidenceRef.current
+          ) {
+            editorKeyboardReturnIntentRef.current = false;
+            foregroundRecoveryActiveRef.current = false;
+            foregroundRecoveryKeepToolbarRef.current = false;
+            setKeyboardPhaseStable('hidden');
+            cancelResumeEditorFocus();
+          }
+        }, 1000);
+        return;
+      }
+      if (!keyboardPositiveEvidenceRef.current) {
+        editorKeyboardReturnIntentRef.current = false;
+        foregroundRecoveryActiveRef.current = false;
+        foregroundRecoveryKeepToolbarRef.current = false;
+        setKeyboardPhaseStable('hidden');
+        cancelResumeEditorFocus();
+      }
+    }, 1200);
+  }, [attemptResumeEditorFocus, cancelResumeEditorFocus, setKeyboardPhaseStable]);
 
   const handleEditorFocusChange = useCallback((focused: boolean) => {
-    if (focused) {
-      editorInputOwnerRef.current = 'editor';
-      setEditorInputFocused(true);
-    } else if (editorInputOwnerRef.current === 'editor') {
-      editorInputOwnerRef.current = null;
-      setEditorInputFocused(false);
+    recordLifecycleEvent(focused ? 'editor-focus' : 'editor-blur');
+    if (!focused && lifecycleBlurPendingRef.current) {
+      // Consume only the false focus report belonging to the lifecycle blur;
+      // ordinary transient TenTap blurs remain ignored by the last-owner model.
+      lifecycleBlurAckRef.current = true;
+      lifecycleBlurPendingRef.current = false;
+      if (
+        appStateRef.current === 'active' &&
+        editorKeyboardReturnIntentRef.current &&
+        editorInputOwnerRef.current === 'editor'
+      ) {
+        requestAnimationFrame(() => attemptResumeEditorFocus());
+      }
+      return;
     }
-  }, []);
+    if (focused) {
+      const alreadyOwnedByEditor = editorInputOwnerRef.current === 'editor';
+      if (alreadyOwnedByEditor) {
+        // During a controlled resume, TenTap's positive focus state is useful
+        // bridge evidence even if Android has not emitted didShow yet. A
+        // normal repeated focus/touch after an intentional hide remains a
+        // no-op, preserving the no-toolbar-after-scroll behavior.
+        if (appStateRef.current === 'active'
+          && editorKeyboardReturnIntentRef.current
+          && resumeFocusSentRef.current) {
+          resumeBridgeFocusEvidenceRef.current = true;
+          keyboardPositiveEvidenceRef.current = true;
+          keyboardHiddenEvidenceRef.current = false;
+          keyboardHidePendingRef.current = false;
+          setKeyboardPhaseStable('visible');
+          confirmResumeEditorFocus();
+        }
+        return;
+      }
+      editorInputOwnerRef.current = 'editor';
+      if (appStateRef.current !== 'active') return;
+      suppressRevealAfterManualScrollRef.current = false;
+      const caret = latestCaretRectRef.current;
+      if (caret && !manualScrollActiveRef.current) {
+        pendingRevealRef.current = { kind: 'caret', top: caret.top, bottom: caret.bottom };
+      }
+      if (Keyboard.isVisible()
+        || (typeof Keyboard.metrics === 'function' && Boolean(Keyboard.metrics()?.height))) {
+        keyboardPositiveEvidenceRef.current = true;
+        keyboardHidePendingRef.current = false;
+        keyboardHiddenEvidenceRef.current = false;
+        revealKeyboardToolbarAfterLayout();
+      } else {
+        // Focus alone is not keyboard evidence; wait for didShow/resize.
+        setKeyboardPhaseStable('hidden');
+      }
+    } else if (editorInputOwnerRef.current === 'editor') {
+      // TenTap can emit a transient blur during commands, WebView reflow, or
+      // app/IME transitions. In the last-owner model this snapshot is not an
+      // ownership transition: keyboard/root/AppState signals own phase
+      // changes, while title/tag focus explicitly switches owner to `other`.
+      // Keep the last editor owner; actual keyboard events own visibility.
+      return;
+    }
+  }, [attemptResumeEditorFocus, confirmResumeEditorFocus, recordLifecycleEvent, setKeyboardPhaseStable]);
 
   const handleNonEditorFocusChange = useCallback((focused: boolean) => {
+    if (focused) recordLifecycleEvent('non-editor-focus');
     if (focused) {
+      if (appStateRef.current !== 'active') return;
+      keyboardPositiveEvidenceRef.current = false;
+      keyboardHidePendingRef.current = false;
       editorInputOwnerRef.current = 'other';
-      setEditorInputFocused(false);
+      keyboardHiddenEvidenceRef.current = false;
+      editorKeyboardReturnIntentRef.current = false;
+      resumeBridgeFocusEvidenceRef.current = false;
+      lifecycleBlurGenerationRef.current += 1;
+      lifecycleBlurPendingRef.current = false;
+      lifecycleBlurAckRef.current = false;
+      foregroundRecoveryActiveRef.current = false;
+      foregroundRecoveryKeepToolbarRef.current = false;
+      cancelResumeEditorFocus();
+      setKeyboardPhaseStable('hidden');
     }
+  }, [cancelResumeEditorFocus, recordLifecycleEvent, setKeyboardPhaseStable]);
+
+  const runPendingReveal = useCallback(() => {
+    const pending = pendingRevealRef.current;
+    if (!pending || appStateRef.current !== 'active'
+      || manualScrollActiveRef.current
+      || suppressRevealAfterManualScrollRef.current) return;
+    const owner = editorInputOwnerRef.current;
+    const baseline = keyboardBaselineHeightRef.current;
+    const current = keyboardCurrentHeightRef.current;
+    const layoutIsResized = baseline !== null && current > 0 && baseline - current > 48;
+    const keyboardVisible = layoutIsResized || (typeof Keyboard.metrics === 'function' && Boolean(Keyboard.metrics()?.height)) || Keyboard.isVisible();
+    if (pending.kind === 'caret') {
+      if (owner !== 'editor' || keyboardPhaseRef.current !== 'visible' || !editorReadyRef.current) return;
+    } else if (owner !== 'other' || !tagInputFocusedRef.current || !keyboardVisible) {
+      return;
+    }
+    const viewportHeight = scrollViewportHeightRef.current;
+    const contentHeight = scrollContentHeightRef.current;
+    if (viewportHeight <= 0 || contentHeight <= 0) return;
+    const targetTop = pending.kind === 'caret' && latestCaretRectRef.current
+      ? editorAreaTopRef.current + editorHostTopRef.current + latestCaretRectRef.current.top
+      : pending.top;
+    const targetBottom = pending.kind === 'caret' && latestCaretRectRef.current
+      ? editorAreaTopRef.current + editorHostTopRef.current + latestCaretRectRef.current.bottom
+      : pending.bottom;
+    const scrollOffset = scrollOffsetRef.current;
+    const safeTop = scrollOffset + 12;
+    const safeBottom = scrollOffset + viewportHeight - 12;
+    if (targetTop >= safeTop && targetBottom <= safeBottom) {
+      pendingRevealRef.current = null;
+      lastRevealCommandRef.current = null;
+      return;
+    }
+    const desired = targetBottom > safeBottom
+      ? targetBottom + 12 - viewportHeight
+      : targetTop - 12;
+    const maxScroll = Math.max(0, contentHeight - viewportHeight);
+    if (desired > maxScroll + 1) return;
+    const target = Math.max(0, Math.min(maxScroll, desired));
+    const previous = lastRevealCommandRef.current;
+    if (
+      previous &&
+      previous.kind === pending.kind &&
+      previous.target === target &&
+      previous.contentHeight === contentHeight &&
+      previous.viewportHeight === viewportHeight
+    ) return;
+    if (Math.abs(target - scrollOffset) < 2) {
+      pendingRevealRef.current = null;
+      lastRevealCommandRef.current = null;
+      return;
+    }
+    lastRevealCommandRef.current = { kind: pending.kind, target, contentHeight, viewportHeight };
+    editorScrollRef.current?.scrollTo({ y: target, animated: false });
   }, []);
 
-  const ensureCaretVisible = useCallback(() => {
-    const caret = editorActiveState.caretRect;
-    if (!keyboardVisible || !editorInputFocused || !editorReady || !caret) return;
-    const viewportHeight = scrollViewportHeightRef.current;
-    if (viewportHeight <= 0) return;
-    const scrollOffset = scrollOffsetRef.current;
-    const caretTop = editorAreaTopRef.current + editorHostTopRef.current + caret.top;
-    const caretBottom = editorAreaTopRef.current + editorHostTopRef.current + caret.bottom;
-    const safeTop = scrollOffset + 12;
-    // The toolbar is a normal sibling below the ScrollView. Its measured
-    // height is already reserved by flex layout; subtracting it again would
-    // double-count the keyboard avoidance area.
-    const safeBottom = scrollOffset + viewportHeight - 12;
-    let target = scrollOffset;
-    if (caretBottom > safeBottom) target += caretBottom - safeBottom;
-    else if (caretTop < safeTop) target -= safeTop - caretTop;
-    target = Math.max(0, target);
-    if (Math.abs(target - scrollOffset) < 2) return;
-    editorScrollRef.current?.scrollTo({ y: target, animated: false });
-  }, [editorActiveState.caretRect, editorInputFocused, editorReady, keyboardVisible]);
+  const scheduleReveal = useCallback(() => {
+    if (caretEnsureFrameRef.current !== null) cancelAnimationFrame(caretEnsureFrameRef.current);
+    caretEnsureFrameRef.current = requestAnimationFrame(() => {
+      caretEnsureFrameRef.current = null;
+      runPendingReveal();
+    });
+  }, [runPendingReveal]);
+
+  const queueCaretReveal = useCallback((caret: RichEditorActiveState['caretRect']) => {
+    latestCaretRectRef.current = caret;
+    if (caret) {
+      const previous = lastCaretGeometryRef.current;
+      const changed = !previous
+        || Math.abs(previous.top - caret.top) > 1
+        || Math.abs(previous.bottom - caret.bottom) > 1;
+      lastCaretGeometryRef.current = { top: caret.top, bottom: caret.bottom };
+      if (manualScrollActiveRef.current) return;
+      if (suppressRevealAfterManualScrollRef.current && !changed) return;
+      suppressRevealAfterManualScrollRef.current = false;
+      if (editorInputOwnerRef.current === 'editor') {
+        pendingRevealRef.current = { kind: 'caret', top: caret.top, bottom: caret.bottom };
+      }
+    } else if (!caret && pendingRevealRef.current?.kind === 'caret') {
+      pendingRevealRef.current = null;
+    }
+    scheduleReveal();
+  }, [scheduleReveal]);
+
+  const queueCaretRevealAfterInput = useCallback(() => {
+    const caret = latestCaretRectRef.current;
+    if (!caret || editorInputOwnerRef.current !== 'editor' || appStateRef.current !== 'active') return;
+    if (manualScrollActiveRef.current) {
+      inputRevealRequestedRef.current = true;
+      return;
+    }
+    inputRevealRequestedRef.current = false;
+    suppressRevealAfterManualScrollRef.current = false;
+    pendingRevealRef.current = { kind: 'caret', top: caret.top, bottom: caret.bottom };
+    lastRevealCommandRef.current = null;
+    scheduleReveal();
+  }, [scheduleReveal]);
+
+  const revealTagInput = useCallback(() => {
+    const inputBottom = tagInputBottomRef.current;
+    if (inputBottom === null) return;
+    suppressRevealAfterManualScrollRef.current = false;
+    const bottom = tagEditorTopRef.current + inputBottom;
+    pendingRevealRef.current = { kind: 'tag', top: bottom, bottom };
+    scheduleReveal();
+  }, [scheduleReveal]);
 
   useEffect(() => {
-    let frame: number | null = requestAnimationFrame(() => {
-      frame = null;
-      ensureCaretVisible();
-    });
+    scheduleReveal();
     return () => {
-      if (frame !== null) cancelAnimationFrame(frame);
+      if (caretEnsureFrameRef.current !== null) {
+        cancelAnimationFrame(caretEnsureFrameRef.current);
+        caretEnsureFrameRef.current = null;
+      }
     };
-  }, [ensureCaretVisible]);
+  }, [keyboardPhase, scheduleReveal]);
 
   useEffect(() => {
     if (isEditing && diaryId) {
@@ -225,16 +763,414 @@ export const EditorScreen: React.FC = () => {
     }
   }, [diaryId]);
 
+  const handleEditorRootLayout = useCallback((height: number) => {
+    if (height <= 0 || appStateRef.current !== 'active') return;
+    recordLifecycleEvent(`root:${Math.round(height)}`);
+    keyboardCurrentHeightRef.current = height;
+    scheduleReveal();
+
+    const metricsVisible = typeof Keyboard.metrics === 'function' && Boolean(Keyboard.metrics()?.height);
+    const systemKeyboardVisible = metricsVisible || Keyboard.isVisible();
+    const baseline = keyboardBaselineHeightRef.current;
+    if (baseline === null) {
+      // Do not learn a baseline from a first layout observed during an
+      // visible recovery transition.
+      if (!keyboardHiddenEvidenceRef.current || systemKeyboardVisible || keyboardPhaseRef.current !== 'hidden') return;
+      keyboardBaselineHeightRef.current = height;
+      keyboardFullHeightStableCountRef.current = 0;
+      return;
+    }
+
+    const resizedForKeyboard = baseline - height > 48;
+    if (resizedForKeyboard) {
+      keyboardFullHeightStableCountRef.current = 0;
+      if (editorInputOwnerRef.current === 'editor') {
+        if (lifecycleBlurPendingRef.current && !editorKeyboardReturnIntentRef.current) {
+          setKeyboardPhaseStable('hidden');
+          return;
+        }
+        keyboardPositiveEvidenceRef.current = true;
+        keyboardHiddenEvidenceRef.current = false;
+        if (editorKeyboardReturnIntentRef.current) {
+          resumeBridgeFocusEvidenceRef.current = true;
+          confirmResumeEditorFocus();
+        }
+        // KAV subscribes to the same didShow event and needs one layout pass
+        // before the toolbar is mounted into the reduced-height sibling row.
+        revealKeyboardToolbarAfterLayout();
+      } else if (editorInputOwnerRef.current === 'other' && tagInputFocusedRef.current) {
+        revealTagInput();
+      }
+      return;
+    }
+
+    if (systemKeyboardVisible) {
+      if (editorInputOwnerRef.current === 'editor') {
+        if (lifecycleBlurPendingRef.current && !editorKeyboardReturnIntentRef.current) {
+          setKeyboardPhaseStable('hidden');
+          return;
+        }
+        keyboardPositiveEvidenceRef.current = true;
+        keyboardHiddenEvidenceRef.current = false;
+        if (editorKeyboardReturnIntentRef.current) {
+          resumeBridgeFocusEvidenceRef.current = true;
+          confirmResumeEditorFocus();
+        }
+        revealKeyboardToolbarAfterLayout();
+      }
+      keyboardFullHeightStableCountRef.current = 0;
+      return;
+    }
+
+    if (foregroundRecoveryActiveRef.current && foregroundRecoveryKeepToolbarRef.current
+      && editorInputOwnerRef.current === 'editor') {
+      // Full-height samples during Activity recovery are not enough to prove
+      // that the keyboard was intentionally dismissed.
+      keyboardFullHeightStableCountRef.current = 0;
+      return;
+    }
+
+    // With Android pan (or a resumed WebView that does not emit another
+    // didShow), a positive TenTap focus is the only reliable resume signal.
+    // Do not turn that confirmed editor session off merely because the root
+    // remained full-height. A subsequent real keyboardDidHide clears it.
+    if (resumeBridgeFocusEvidenceRef.current && editorInputOwnerRef.current === 'editor') {
+      keyboardFullHeightStableCountRef.current = 0;
+      return;
+    }
+
+    if (keyboardHidePendingRef.current && editorInputOwnerRef.current === 'editor') {
+      keyboardFullHeightStableCountRef.current += 1;
+      if (keyboardFullHeightStableCountRef.current >= 3) {
+        keyboardPositiveEvidenceRef.current = false;
+        keyboardHidePendingRef.current = false;
+        keyboardHiddenEvidenceRef.current = true;
+        keyboardBaselineHeightRef.current = height;
+        keyboardFullHeightStableCountRef.current = 0;
+        setKeyboardPhaseStable('hidden');
+      }
+      return;
+    }
+
+    if (keyboardHiddenEvidenceRef.current && keyboardPhaseRef.current === 'hidden') {
+      // Baseline may legitimately move with system bars, but only while the
+      // keyboard is explicitly known to be hidden.
+      keyboardBaselineHeightRef.current = height;
+      keyboardFullHeightStableCountRef.current = 0;
+      return;
+    }
+
+    // A keyboard closed while the app was backgrounded may not emit
+    // keyboardDidHide. Require repeated full-height measurements before
+    // treating the return to the known full-height region as hide evidence.
+    if (editorInputOwnerRef.current === 'editor' && keyboardPositiveEvidenceRef.current) {
+      keyboardFullHeightStableCountRef.current += 1;
+      if (keyboardFullHeightStableCountRef.current >= 3) {
+        keyboardPositiveEvidenceRef.current = false;
+        keyboardHidePendingRef.current = false;
+        keyboardHiddenEvidenceRef.current = true;
+        keyboardBaselineHeightRef.current = height;
+        keyboardFullHeightStableCountRef.current = 0;
+        setKeyboardPhaseStable('hidden');
+      }
+    } else {
+      keyboardFullHeightStableCountRef.current = 0;
+    }
+  }, [confirmResumeEditorFocus, recordLifecycleEvent, revealTagInput, scheduleReveal, setKeyboardPhaseStable]);
+
   useEffect(() => {
-    const syncKeyboardVisibility = () => setKeyboardVisible(Keyboard.isVisible());
-    syncKeyboardVisibility();
-    const showSubscription = Keyboard.addListener('keyboardDidShow', () => setKeyboardVisible(true));
-    const hideSubscription = Keyboard.addListener('keyboardDidHide', () => setKeyboardVisible(false));
+    let activeSyncFrame: number | null = null;
+    let activeSyncCount = 0;
+    const syncKeyboardVisibility = () => {
+      if (appStateRef.current !== 'active') return;
+      const generation = foregroundRecoveryGenerationRef.current;
+      const protectedRecoverySample = foregroundRecoveryActiveRef.current
+        && foregroundRecoveryKeepToolbarRef.current;
+      editorRootRef.current?.measureInWindow((_x, _y, _width, height) => {
+        if (appStateRef.current === 'active'
+          && generation === foregroundRecoveryGenerationRef.current
+          && height > 0) {
+          if (protectedRecoverySample) {
+            // This sample was requested during the protected recovery window;
+            // keep the latest raw height but do not let its callback confirm a
+            // premature full-height hide after the window advances.
+            keyboardCurrentHeightRef.current = height;
+            scheduleReveal();
+            return;
+          }
+          handleEditorRootLayout(height);
+        }
+      });
+      const baseline = keyboardBaselineHeightRef.current;
+      const current = keyboardCurrentHeightRef.current;
+      const layoutIsResized = baseline !== null && current > 0 && baseline - current > 48;
+      const metricsVisible = typeof Keyboard.metrics === 'function' && Boolean(Keyboard.metrics()?.height);
+      const keyboardVisible = layoutIsResized || metricsVisible || Keyboard.isVisible();
+      if (editorInputOwnerRef.current === 'editor' && keyboardVisible) {
+        if (lifecycleBlurPendingRef.current && !editorKeyboardReturnIntentRef.current) {
+          setKeyboardPhaseStable('hidden');
+          return;
+        }
+        keyboardPositiveEvidenceRef.current = true;
+        keyboardHiddenEvidenceRef.current = false;
+        if (editorKeyboardReturnIntentRef.current) {
+          resumeBridgeFocusEvidenceRef.current = true;
+          confirmResumeEditorFocus();
+        }
+        revealKeyboardToolbarAfterLayout();
+      } else if (editorInputOwnerRef.current !== 'editor') {
+        keyboardPositiveEvidenceRef.current = false;
+        keyboardHidePendingRef.current = false;
+        setKeyboardPhaseStable('hidden');
+        if (tagInputFocusedRef.current && keyboardVisible) revealTagInput();
+      }
+    };
+    const scheduleActiveSync = () => {
+      if (activeSyncFrame !== null) cancelAnimationFrame(activeSyncFrame);
+      activeSyncCount = 0;
+      let settlementFrames = 0;
+      const maxActiveSyncFrames = 18;
+      const preserveToolbar = foregroundRecoveryKeepToolbarRef.current;
+      foregroundRecoveryKeepToolbarRef.current = preserveToolbar;
+      foregroundRecoveryActiveRef.current = preserveToolbar;
+      foregroundRecoveryGenerationRef.current += 1;
+      const syncFrame = () => {
+        activeSyncFrame = null;
+        if (appStateRef.current !== 'active') return;
+        syncKeyboardVisibility();
+        activeSyncCount += 1;
+        if (activeSyncCount < maxActiveSyncFrames) {
+          activeSyncFrame = requestAnimationFrame(syncFrame);
+        } else if ((preserveToolbar || settlementFrames > 0) && settlementFrames < 3) {
+          // Only after the protected recovery window do full-height samples
+          // participate in the stable-hide confirmation.
+          if (settlementFrames === 0) {
+            foregroundRecoveryActiveRef.current = false;
+            foregroundRecoveryKeepToolbarRef.current = false;
+          }
+          settlementFrames += 1;
+          activeSyncFrame = requestAnimationFrame(syncFrame);
+        } else {
+          foregroundRecoveryActiveRef.current = false;
+          foregroundRecoveryKeepToolbarRef.current = false;
+        }
+      };
+      activeSyncFrame = requestAnimationFrame(syncFrame);
+    };
+    const showSubscription = Keyboard.addListener('keyboardDidShow', (event) => {
+      recordLifecycleEvent('keyboard-show');
+      scheduleColdKeyboardTrace(event);
+      // A lifecycle blur owns the editor while the Activity is not visible;
+      // do not let a late show from the old WebView session rewrite state.
+      if (appStateRef.current !== 'active') return;
+      if (appStateRef.current === 'active') Keyboard.scheduleLayoutAnimation(event);
+      if (editorInputOwnerRef.current === 'editor') {
+        if (lifecycleBlurPendingRef.current && !editorKeyboardReturnIntentRef.current) {
+          setKeyboardPhaseStable('hidden');
+          return;
+        }
+        keyboardPositiveEvidenceRef.current = true;
+        keyboardHidePendingRef.current = false;
+        keyboardHiddenEvidenceRef.current = false;
+        keyboardFullHeightStableCountRef.current = 0;
+        if (editorKeyboardReturnIntentRef.current) {
+          resumeBridgeFocusEvidenceRef.current = true;
+          confirmResumeEditorFocus();
+        }
+        revealKeyboardToolbarAfterLayout();
+      } else {
+        keyboardPositiveEvidenceRef.current = false;
+        keyboardHidePendingRef.current = false;
+        setKeyboardPhaseStable('hidden');
+        if (tagInputFocusedRef.current) revealTagInput();
+      }
+    });
+    const hideSubscription = Keyboard.addListener('keyboardDidHide', (event) => {
+      recordLifecycleEvent('keyboard-hide');
+      keyboardToolbarGenerationRef.current += 1;
+      if (keyboardToolbarFrameRef.current !== null) {
+        cancelAnimationFrame(keyboardToolbarFrameRef.current);
+        keyboardToolbarFrameRef.current = null;
+      }
+      if (appStateRef.current === 'active') Keyboard.scheduleLayoutAnimation(event);
+      keyboardFullHeightStableCountRef.current = 0;
+      if (appStateRef.current !== 'active') {
+        if (editorInputOwnerRef.current === 'editor') {
+          // Blur-induced hide must not rewrite the frozen resume intent.
+          keyboardHidePendingRef.current = true;
+          keyboardHiddenEvidenceRef.current = false;
+        }
+        return;
+      }
+      if (editorInputOwnerRef.current === 'editor') {
+        if (foregroundRecoveryActiveRef.current && editorKeyboardReturnIntentRef.current) {
+          // A keyboardDidHide delivered during the bounded foreground handoff
+          // can belong to the pre-background WebView session. Keep the
+          // return intent and let a later positive signal (or the bounded
+          // recovery outcome) classify this event.
+          keyboardHidePendingRef.current = true;
+          keyboardHiddenEvidenceRef.current = false;
+          scheduleActiveSync();
+          return;
+        }
+        // A hide is only a candidate; root full-height measurements confirm it.
+        resumeBridgeFocusEvidenceRef.current = false;
+        keyboardHidePendingRef.current = true;
+        keyboardHiddenEvidenceRef.current = false;
+      } else {
+        keyboardPositiveEvidenceRef.current = false;
+        keyboardHidePendingRef.current = false;
+        keyboardHiddenEvidenceRef.current = true;
+        setKeyboardPhaseStable('hidden');
+      }
+      scheduleActiveSync();
+    });
+    // Android may report window blur before the AppState change/background
+    // event. Both paths share one idempotent boundary so the pre-hide keyboard
+    // snapshot is frozen before any lifecycle-induced keyboardDidHide arrives.
+    const enterLifecycleInactive = (state: 'inactive' | 'background') => {
+      appStateRef.current = state;
+      recordLifecycleEvent(`app-${state}`);
+      if (!lifecycleInactiveRef.current) {
+        lifecycleInactiveRef.current = true;
+        const metricsVisible = typeof Keyboard.metrics === 'function' && Boolean(Keyboard.metrics()?.height);
+        const baseline = keyboardBaselineHeightRef.current;
+        const current = keyboardCurrentHeightRef.current;
+        const resizedForKeyboard = baseline !== null && current > 0 && baseline - current > 48;
+        editorKeyboardReturnIntentRef.current = editorInputOwnerRef.current === 'editor'
+          && (keyboardPhaseRef.current === 'visible'
+            || keyboardPositiveEvidenceRef.current
+            || metricsVisible
+            || Keyboard.isVisible()
+            || resizedForKeyboard)
+          && !keyboardHiddenEvidenceRef.current;
+        foregroundRecoveryKeepToolbarRef.current = editorKeyboardReturnIntentRef.current;
+        foregroundRecoveryGenerationRef.current += 1;
+        foregroundRecoveryActiveRef.current = false;
+        resumeBridgeFocusEvidenceRef.current = false;
+        cancelResumeEditorFocus();
+        lifecycleBlurGenerationRef.current += 1;
+        lifecycleBlurPendingRef.current = true;
+        lifecycleBlurAckRef.current = false;
+        // Subsequent evidence belongs to the resumed session, not the old
+        // focused WebView. The return intent above is the frozen snapshot.
+        keyboardPositiveEvidenceRef.current = false;
+        keyboardHidePendingRef.current = false;
+        keyboardHiddenEvidenceRef.current = true;
+        if (!lifecycleBlurSentRef.current && editorRef.current) {
+          editorRef.current.blur();
+          lifecycleBlurSentRef.current = true;
+        }
+        if (editorInputOwnerRef.current === 'editor') setKeyboardPhaseStable('hidden');
+      }
+      if (activeSyncFrame !== null) cancelAnimationFrame(activeSyncFrame);
+      activeSyncFrame = null;
+    };
+    const appStateSubscription = AppState.addEventListener('change', (state) => {
+      recordLifecycleEvent(`app-change:${state}`);
+      if (state !== 'active') {
+        enterLifecycleInactive(state === 'background' ? 'background' : 'inactive');
+        return;
+      }
+      lifecycleInactiveRef.current = false;
+      lifecycleBlurSentRef.current = false;
+      appStateRef.current = state;
+      scheduleLifecycleTraceSummary();
+      if (editorKeyboardReturnIntentRef.current && editorInputOwnerRef.current === 'editor') {
+        if (!foregroundRecoveryActiveRef.current) beginResumeEditorFocus();
+      } else {
+        cancelResumeEditorFocus();
+        setKeyboardPhaseStable('hidden');
+      }
+      scheduleActiveSync();
+    });
+    const lifecycleBlurSubscription = AppState.addEventListener('blur', () => {
+      recordLifecycleEvent('app-blur');
+      enterLifecycleInactive('inactive');
+    });
+    const windowFocusSubscription = AppState.addEventListener('focus', () => {
+      recordLifecycleEvent('app-focus');
+      // Android can deliver window focus before the AppState `active` change.
+      // Treat this as an early foreground signal only; it never creates a
+      // closed-session keyboard intent.
+      appStateRef.current = 'active';
+      if (editorKeyboardReturnIntentRef.current
+        && editorInputOwnerRef.current === 'editor'
+        && !foregroundRecoveryActiveRef.current) {
+        beginResumeEditorFocus();
+      }
+      if (editorKeyboardReturnIntentRef.current && editorInputOwnerRef.current === 'editor') {
+        if (resumeWindowFocusFrameRef.current !== null) {
+          cancelAnimationFrame(resumeWindowFocusFrameRef.current);
+        }
+        const generation = resumeFocusGenerationRef.current;
+        const lifecycleGeneration = lifecycleBlurGenerationRef.current;
+        resumeWindowFocusFrameRef.current = requestAnimationFrame(() => {
+          resumeWindowFocusFrameRef.current = null;
+          if (
+            generation === resumeFocusGenerationRef.current &&
+            lifecycleGeneration === lifecycleBlurGenerationRef.current &&
+            appStateRef.current === 'active' &&
+            editorKeyboardReturnIntentRef.current &&
+            editorInputOwnerRef.current === 'editor'
+          ) {
+            attemptResumeEditorFocus();
+          }
+        });
+      }
+      scheduleLifecycleTraceSummary();
+      scheduleActiveSync();
+    });
+    // Refresh after the listener is installed so a foreground transition
+    // between render and effect setup cannot leave this ref permanently stale.
+    const currentAppState = AppState.currentState;
+    if (currentAppState === 'active') {
+      appStateRef.current = 'active';
+      lifecycleInactiveRef.current = false;
+    } else if (currentAppState === 'background' || currentAppState === 'inactive') {
+      appStateRef.current = currentAppState;
+      lifecycleInactiveRef.current = true;
+    }
+    if (appStateRef.current === 'active' && currentAppState !== 'background' && currentAppState !== 'inactive') {
+      scheduleActiveSync();
+    }
     return () => {
+      if (activeSyncFrame !== null) cancelAnimationFrame(activeSyncFrame);
+      cancelResumeEditorFocus();
+      if (lifecycleTraceTimerRef.current !== null) {
+        clearTimeout(lifecycleTraceTimerRef.current);
+        lifecycleTraceTimerRef.current = null;
+      }
+      coldKeyboardTraceGenerationRef.current += 1;
+      if (coldKeyboardTraceTimerRef.current !== null) {
+        clearTimeout(coldKeyboardTraceTimerRef.current);
+        coldKeyboardTraceTimerRef.current = null;
+      }
+      keyboardToolbarGenerationRef.current += 1;
+      if (keyboardToolbarFrameRef.current !== null) {
+        cancelAnimationFrame(keyboardToolbarFrameRef.current);
+        keyboardToolbarFrameRef.current = null;
+      }
       showSubscription.remove();
       hideSubscription.remove();
+      appStateSubscription.remove();
+      lifecycleBlurSubscription.remove();
+      windowFocusSubscription.remove();
     };
-  }, []);
+  }, [
+    attemptResumeEditorFocus,
+    beginResumeEditorFocus,
+    cancelResumeEditorFocus,
+    confirmResumeEditorFocus,
+    handleEditorRootLayout,
+    recordLifecycleEvent,
+    revealKeyboardToolbarAfterLayout,
+    scheduleColdKeyboardTrace,
+    scheduleLifecycleTraceSummary,
+    revealTagInput,
+    scheduleReveal,
+    setKeyboardPhaseStable,
+  ]);
 
   useEffect(() => {
     if (!editorReady || !editorRef.current) return;
@@ -243,189 +1179,16 @@ export const EditorScreen: React.FC = () => {
         mediaId: item.id,
         mediaType: item.type,
         uri: item.type === 'image' ? item.uri : undefined,
-        thumbnailUri:
-          item.type === 'video'
-            ? runtimeVideoPreviews[item.id] ?? item.thumbnail
-            : undefined,
+        thumbnailUri: item.type === 'video' ? item.thumbnail : undefined,
         label: item.fileName ?? null,
       })),
     );
-  }, [editorReady, media, runtimeVideoPreviews]);
-
-  // VideoThumbnail is a native SharedRef and cannot cross the WebView boundary.
-  // Convert one missing video preview at a time into a cache file URI. This is
-  // intentionally tied to the media collection, never to text transactions.
-  useEffect(() => {
-    // A media/editor change can happen while native thumbnail generation is
-    // awaiting. Keep the latest collection visible to the one active worker.
-    // A completed worker wakes this effect once, so a cancelled item is queued
-    // again only after every native ref/player from the old worker is released.
-    if (!editorReady) return;
-
-    if (videoPreviewWorkerRef.current) {
-      const worker = videoPreviewWorkerRef.current;
-      if (observedVideoPreviewWorkerRef.current !== worker) {
-        observedVideoPreviewWorkerRef.current = worker;
-        void worker.then(() => {
-          if (observedVideoPreviewWorkerRef.current === worker) {
-            observedVideoPreviewWorkerRef.current = null;
-          }
-          if (mountedRef.current) setVideoPreviewWake((current) => current + 1);
-        }, () => {
-          if (observedVideoPreviewWorkerRef.current === worker) {
-            observedVideoPreviewWorkerRef.current = null;
-          }
-          if (mountedRef.current) setVideoPreviewWake((current) => current + 1);
-        });
-      }
-      return;
-    }
-
-    const generation = ++videoPreviewGenerationRef.current;
-    let cancelled = false;
-    const candidates = media.filter(
-      (item) =>
-        item.type === 'video' &&
-        !item.thumbnail &&
-        !runtimeVideoPreviewsRef.current.has(item.id) &&
-        !attemptedVideoPreviewIdsRef.current.has(item.id) &&
-        !failedVideoPreviewIdsRef.current.has(item.id),
-    );
-
-    for (const item of candidates) attemptedVideoPreviewIdsRef.current.add(item.id);
-
-    const generateMissingPreviews = async () => {
-      for (const item of candidates) {
-        if (cancelled || !mountedRef.current || generation !== videoPreviewGenerationRef.current) {
-          return;
-        }
-
-        let player: ReturnType<typeof createVideoPlayer> | null = null;
-        let thumbnail: SharedRefType<'image'> | null = null;
-        let context: ImageManipulatorContext | null = null;
-        let imageRef: ImageRef | null = null;
-        let savedUri: string | null = null;
-
-        try {
-          player = createVideoPlayer(item.uri);
-          const thumbnails = await player.generateThumbnailsAsync([0.1], {
-            maxWidth: 1200,
-            maxHeight: 1200,
-          });
-          thumbnail = thumbnails[0] ?? null;
-          if (!thumbnail) continue;
-
-          context = ImageManipulator.manipulate(thumbnail);
-          imageRef = await context.renderAsync();
-          const result = await imageRef.saveAsync({
-            format: SaveFormat.JPEG,
-            base64: false,
-            compress: 0.82,
-          });
-          savedUri = result.uri;
-
-          if (cancelled || !mountedRef.current || generation !== videoPreviewGenerationRef.current) {
-            await deleteTransientPreview(savedUri);
-            continue;
-          }
-
-          runtimeVideoPreviewsRef.current.set(item.id, savedUri);
-          generatedVideoPreviewUrisRef.current.set(item.id, savedUri);
-          generatedVideoPreviewSourcesRef.current.set(item.id, item.uri);
-          setRuntimeVideoPreviews((current) => ({ ...current, [item.id]: savedUri! }));
-        } catch (error) {
-          console.warn(`Failed to generate video preview for ${item.id}:`, error);
-          if (!cancelled && mountedRef.current && generation === videoPreviewGenerationRef.current) {
-            // Keep a genuine failure on the fallback for this session; a
-            // cancelled worker is deliberately left eligible for requeue.
-            failedVideoPreviewIdsRef.current.add(item.id);
-          }
-        } finally {
-          releaseNativeRef(imageRef);
-          releaseNativeRef(context);
-          releaseNativeRef(thumbnail);
-          releaseNativeRef(player);
-        }
-      }
-    };
-
-    const worker = generateMissingPreviews();
-    videoPreviewWorkerRef.current = worker;
-    void worker.then(() => {
-      if (videoPreviewWorkerRef.current === worker) {
-        videoPreviewWorkerRef.current = null;
-      }
-    }, () => {
-      if (videoPreviewWorkerRef.current === worker) {
-        videoPreviewWorkerRef.current = null;
-      }
-    });
-    return () => {
-      cancelled = true;
-      if (videoPreviewGenerationRef.current === generation) {
-        videoPreviewGenerationRef.current += 1;
-      }
-      if (!editorReadyRef.current) failedVideoPreviewIdsRef.current.clear();
-      for (const item of candidates) {
-        if (
-          !runtimeVideoPreviewsRef.current.has(item.id) &&
-          !failedVideoPreviewIdsRef.current.has(item.id)
-        ) {
-          attemptedVideoPreviewIdsRef.current.delete(item.id);
-        }
-      }
-    };
-  }, [editorReady, media, videoPreviewWake]);
-
-  // A removed media block may leave only a generated cache file. It is safe to
-  // remove that transient file now; persisted media and thumbnails are excluded.
-  useEffect(() => {
-    const activeItems = new Map(media.map((item) => [item.id, item]));
-    for (const [mediaId, uri] of generatedVideoPreviewUrisRef.current) {
-      const activeItem = activeItems.get(mediaId);
-      const generatedSource = generatedVideoPreviewSourcesRef.current.get(mediaId);
-      if (
-        !activeItem ||
-        activeItem.type !== 'video' ||
-        activeItem.thumbnail ||
-        (generatedSource !== undefined && generatedSource !== activeItem.uri)
-      ) {
-        generatedVideoPreviewUrisRef.current.delete(mediaId);
-        generatedVideoPreviewSourcesRef.current.delete(mediaId);
-        runtimeVideoPreviewsRef.current.delete(mediaId);
-        void deleteTransientPreview(uri);
-        setVideoPreviewWake((current) => current + 1);
-        setRuntimeVideoPreviews((current) => {
-          if (!(mediaId in current)) return current;
-          const next = { ...current };
-          delete next[mediaId];
-          return next;
-        });
-        if (activeItem?.thumbnail) {
-          attemptedVideoPreviewIdsRef.current.delete(mediaId);
-          failedVideoPreviewIdsRef.current.delete(mediaId);
-        }
-      }
-    }
-    for (const mediaId of attemptedVideoPreviewIdsRef.current) {
-      if (!activeItems.has(mediaId)) attemptedVideoPreviewIdsRef.current.delete(mediaId);
-    }
-    for (const mediaId of failedVideoPreviewIdsRef.current) {
-      if (!activeItems.has(mediaId)) failedVideoPreviewIdsRef.current.delete(mediaId);
-    }
-  }, [media]);
+  }, [editorReady, media]);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      videoPreviewGenerationRef.current += 1;
-      for (const uri of generatedVideoPreviewUrisRef.current.values()) {
-        void deleteTransientPreview(uri);
-      }
-      generatedVideoPreviewUrisRef.current.clear();
-      generatedVideoPreviewSourcesRef.current.clear();
-      runtimeVideoPreviewsRef.current.clear();
     };
   }, []);
 
@@ -446,6 +1209,61 @@ export const EditorScreen: React.FC = () => {
     setEditorReady(false);
     setEditorLoadError(null);
     setEditorMountKey((current) => current + 1);
+  };
+
+  const runVideoThumbnailQueue = async (): Promise<void> => {
+    if (videoThumbnailWorkerRef.current) return;
+    videoThumbnailWorkerRef.current = true;
+    try {
+      while (videoThumbnailQueueRef.current.length > 0) {
+        const next = videoThumbnailQueueRef.current.shift();
+        if (!next) continue;
+        const result = await createPersistentVideoThumbnail(next.item);
+        if (result) {
+          const original = originalMediaRef.current.find((item) => item.id === result.id);
+          if ((!original || !original.thumbnail) && result.thumbnail) {
+            generatedThumbnailDerivativesRef.current.set(result.id, result.thumbnail);
+          }
+          stagedMediaRef.current = stagedMediaRef.current.map((staged) =>
+            staged.id === result.id ? result : staged,
+          );
+          if (mountedRef.current) {
+            setMedia((current) => current.map((currentItem) =>
+              currentItem.id === result.id ? result : currentItem,
+            ));
+          }
+        } else {
+          // One failed attempt per session keeps a missing-frame fallback
+          // stable without creating a retry loop or player churn.
+          videoThumbnailFailedRef.current.add(next.item.id);
+        }
+        next.resolve(result);
+        videoThumbnailTasksRef.current.delete(next.item.id);
+      }
+    } finally {
+      videoThumbnailWorkerRef.current = false;
+    }
+  };
+
+  const startVideoThumbnailTask = (item: MediaItem): Promise<MediaItem | null> | null => {
+    if (item.type !== 'video' || item.thumbnail || videoThumbnailFailedRef.current.has(item.id)) return null;
+    const existing = videoThumbnailTasksRef.current.get(item.id);
+    if (existing) return existing;
+
+    let resolveTask!: (result: MediaItem | null) => void;
+    const task = new Promise<MediaItem | null>((resolve) => {
+      resolveTask = resolve;
+    });
+    videoThumbnailTasksRef.current.set(item.id, task);
+    videoThumbnailQueueRef.current.push({ item, resolve: resolveTask });
+    void runVideoThumbnailQueue();
+    return task;
+  };
+
+  const flushVideoThumbnailTasks = async (): Promise<void> => {
+    while (videoThumbnailTasksRef.current.size > 0) {
+      await Promise.all([...videoThumbnailTasksRef.current.values()]);
+    }
   };
 
   // Auto-save draft with debounce
@@ -548,6 +1366,16 @@ export const EditorScreen: React.FC = () => {
     );
   };
 
+  const getCurrentMedia = (): MediaItem[] =>
+    mediaRef.current.map((item) => {
+      const staged = stagedMediaRef.current.find((candidate) => candidate.id === item.id);
+      if (staged) return staged;
+      const generatedThumbnail = generatedThumbnailDerivativesRef.current.get(item.id);
+      return generatedThumbnail && !item.thumbnail
+        ? { ...item, thumbnail: generatedThumbnail }
+        : item;
+    });
+
   const autoSaveDraft = async () => {
     if (manualSaveRef.current) return;
     if (autoSaveInFlightRef.current) {
@@ -557,8 +1385,9 @@ export const EditorScreen: React.FC = () => {
     const task = (async () => {
       try {
         const draftId = getDraftId(diaryId);
+        await flushVideoThumbnailTasks();
         const editorMarkup = editorRef.current ? await editorRef.current.getMarkup() : content;
-        const persistedMedia = getPersistedMedia(editorMarkup, media);
+        const persistedMedia = getPersistedMedia(editorMarkup, getCurrentMedia());
         setContentLength(extractPlainText(editorMarkup).length);
 
         const hasChanges = isEditing
@@ -620,16 +1449,47 @@ export const EditorScreen: React.FC = () => {
     setContentLength(extractPlainText(draftData.content).length);
     setDate(draftData.date);
     setMedia(draftData.media);
+    for (const item of draftData.media) {
+      if (item.type === 'video' && !item.thumbnail) void startVideoThumbnailTask(item);
+    }
     setTags(draftData.tags);
     editorDirtyRef.current = true;
     setHasUnsavedChanges(true);
     setDraftDialogVisible(false);
   };
 
+  const cleanupStagedMediaAfterCancel = async (): Promise<void> => {
+    // Include a thumbnail that finished while the cancel dialog was open.
+    await flushVideoThumbnailTasks();
+    const staged = stagedMediaRef.current;
+    stagedMediaRef.current = [];
+    for (const item of staged) {
+      await deleteMedia(item.uri);
+      if (item.thumbnail) await deleteMedia(item.thumbnail);
+    }
+    const derivatives = [...generatedThumbnailDerivativesRef.current.values()];
+    generatedThumbnailDerivativesRef.current.clear();
+    for (const thumbnail of derivatives) await deleteMedia(thumbnail);
+  };
+
   const discardDraft = async () => {
     try {
       const draftId = getDraftId(diaryId);
+      const discardedMedia = draftData?.media ?? [];
       await deleteDraft(draftId);
+      // This is only the initial "discard found draft" action. Do not touch
+      // the current editor session's staged media or thumbnail backfill.
+      for (const item of discardedMedia) {
+        try {
+          if (!(await isMediaReferenced(item))) {
+            await deleteMedia(item.uri);
+            if (item.thumbnail) await deleteMedia(item.thumbnail);
+          }
+        } catch (error) {
+          // Draft cleanup is best-effort and must not prevent editing.
+          console.warn('Failed to clean discarded draft media:', error);
+        }
+      }
     } catch (error) {
       console.error('Failed to delete draft:', error);
     }
@@ -648,6 +1508,7 @@ export const EditorScreen: React.FC = () => {
         setInitialCreatedAt(diary.createdAt);
         const orderedMedia = assignMediaPositions(getOrderedMedia(diary.media));
         setMedia(orderedMedia);
+        originalMediaRef.current = orderedMedia;
         setOriginalMedia(orderedMedia);
         setTags(diary.tags);
         setInitialTitle(diary.title);
@@ -656,6 +1517,11 @@ export const EditorScreen: React.FC = () => {
         setInitialTags(diary.tags);
         editorMediaIdsRef.current = collectMediaIds(diary.content);
         setEntryLoaded(true);
+
+        // Upgrade historical videos without staging or deleting their source.
+        for (const item of orderedMedia) {
+          if (item.type === 'video' && !item.thumbnail) void startVideoThumbnailTask(item);
+        }
 
         await checkDraft({
           title: diary.title,
@@ -703,6 +1569,7 @@ export const EditorScreen: React.FC = () => {
             const savedItem = { ...item, uri: savedUri };
             stagedMediaRef.current.push(savedItem);
             setMedia((current) => assignMediaPositions([...current, savedItem]));
+            if (savedItem.type === 'video') void startVideoThumbnailTask(savedItem);
             if (editorReady && editorRef.current) {
               editorMediaIdsRef.current.add(item.id);
               if (item.type === 'video') editorRef.current.insertVideo(item.id);
@@ -751,8 +1618,10 @@ export const EditorScreen: React.FC = () => {
     let editorMarkup = content;
     let saveSucceeded = false;
     try {
+      await flushVideoThumbnailTasks();
       editorMarkup = editorRef.current ? await editorRef.current.getMarkup() : content;
-      const persistedMedia = getPersistedMedia(editorMarkup, media);
+      const currentMedia = getCurrentMedia();
+      const persistedMedia = getPersistedMedia(editorMarkup, currentMedia);
       if (!title.trim() && !editorMarkup.trim() && persistedMedia.length === 0) {
         setEmptyContentDialogVisible(true);
         return false;
@@ -843,6 +1712,7 @@ export const EditorScreen: React.FC = () => {
         setOriginalMedia(savedMedia);
         setInitialCreatedAt(parsedCreatedAt);
       }
+      originalMediaRef.current = savedMedia;
 
       editorDirtyRef.current = false;
       editorMediaIdsRef.current = collectMediaIds(editorMarkup);
@@ -854,6 +1724,8 @@ export const EditorScreen: React.FC = () => {
         navigation.goBack();
       }
       stagedMediaRef.current = [];
+      // Existing-media derivatives are now persisted in the committed row.
+      generatedThumbnailDerivativesRef.current.clear();
       return true;
     } catch (error) {
       console.error('Failed to save diary:', error);
@@ -890,12 +1762,20 @@ export const EditorScreen: React.FC = () => {
   return (
     <SafeAreaView style={styles.mainContainer} edges={['top']}>
       <KeyboardAvoidingView
+        ref={keyboardAvoidingViewRef}
         style={styles.keyboardView}
+        // Expo Go on the target device reports keyboard visibility without
+        // resizing the root (pan/overlay). Let KAV provide the missing height
+        // boundary so the normal toolbar sibling remains above the IME.
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={0}
+        keyboardVerticalOffset={keyboardAvoidingOffsetRef.current}
         enabled
       >
-        <View style={styles.contentContainer}>
+        <View
+          ref={editorRootRef}
+          style={styles.contentContainer}
+          onLayout={(event) => handleEditorRootLayout(event.nativeEvent.layout.height)}
+        >
           <View style={styles.header}>
             <TouchableOpacity
               style={styles.headerButton}
@@ -926,10 +1806,41 @@ export const EditorScreen: React.FC = () => {
             scrollEventThrottle={16}
             onLayout={(event) => {
               scrollViewportHeightRef.current = event.nativeEvent.layout.height;
-              ensureCaretVisible();
+              scheduleReveal();
+            }}
+            onContentSizeChange={(_, height) => {
+              scrollContentHeightRef.current = height;
+              scheduleReveal();
+            }}
+            onScrollBeginDrag={() => {
+              manualScrollActiveRef.current = true;
+              suppressRevealAfterManualScrollRef.current = true;
+              pendingRevealRef.current = null;
+              lastRevealCommandRef.current = null;
+              if (caretEnsureFrameRef.current !== null) {
+                cancelAnimationFrame(caretEnsureFrameRef.current);
+                caretEnsureFrameRef.current = null;
+              }
+            }}
+            onScrollEndDrag={() => {
+              // Keep reveal suppressed until a new caret/focus/keyboard/tag
+              // signal arrives. This prevents an old caret from reclaiming a
+              // user scroll, including devices without momentum callbacks.
+              manualScrollActiveRef.current = false;
+              if (inputRevealRequestedRef.current) queueCaretRevealAfterInput();
+            }}
+            onMomentumScrollBegin={() => {
+              manualScrollActiveRef.current = true;
+            }}
+            onMomentumScrollEnd={() => {
+              manualScrollActiveRef.current = false;
+              if (inputRevealRequestedRef.current) queueCaretRevealAfterInput();
             }}
             onScroll={(event) => {
               scrollOffsetRef.current = event.nativeEvent.contentOffset.y;
+              if (!manualScrollActiveRef.current && !suppressRevealAfterManualScrollRef.current) {
+                scheduleReveal();
+              }
             }}
           >
             {/* Date selector */}
@@ -970,10 +1881,11 @@ export const EditorScreen: React.FC = () => {
               <View style={styles.divider} />
               {entryLoaded && !editorLoadError ? (
                 <View
-                  onLayout={(event) => {
-                    editorHostTopRef.current = event.nativeEvent.layout.y;
-                  }}
-                >
+                onLayout={(event) => {
+                  editorHostTopRef.current = event.nativeEvent.layout.y;
+                  scheduleReveal();
+                }}
+              >
                   <RichEditorHost
                     key={editorMountKey}
                     ref={editorRef}
@@ -981,6 +1893,7 @@ export const EditorScreen: React.FC = () => {
                     showToolbar={false}
                     onStateChange={(state) => {
                       setEditorActiveState(state);
+                      queueCaretReveal(state.caretRect);
                       // A delayed false snapshot can follow the native/WebView
                       // touch event. Only a positive editor snapshot may claim
                       // ownership; title/tag focus explicitly revokes it.
@@ -993,11 +1906,13 @@ export const EditorScreen: React.FC = () => {
                       editorRef.current = adapter;
                       const state = adapter.getActiveState();
                       setEditorActiveState(state);
+                      queueCaretReveal(state.caretRect);
                       if (state.isFocused) handleEditorFocusChange(true);
                       setEditorLoadError(null);
                       setEditorReady(true);
                     }}
                     onDirty={() => {
+                      queueCaretRevealAfterInput();
                       if (!editorDirtyRef.current) {
                         editorDirtyRef.current = true;
                         setHasUnsavedChanges(true);
@@ -1060,22 +1975,38 @@ export const EditorScreen: React.FC = () => {
               />
             </View>
 
-            <TagEditor
-              selectedTags={tags}
-              onTagsChange={setTags}
-              onInputFocus={handleNonEditorFocusChange}
-            />
+            <View
+              onLayout={(event) => {
+                tagEditorTopRef.current = event.nativeEvent.layout.y;
+                if (tagInputFocusedRef.current) revealTagInput();
+              }}
+            >
+              <TagEditor
+                selectedTags={tags}
+                onTagsChange={setTags}
+                onInputLayout={(bottomWithinTagEditor) => {
+                  tagInputBottomRef.current = bottomWithinTagEditor;
+                  if (tagInputFocusedRef.current) revealTagInput();
+                }}
+                onInputFocus={(focused) => {
+                  tagInputFocusedRef.current = focused;
+                  handleNonEditorFocusChange(focused);
+                  if (focused) revealTagInput();
+                }}
+              />
+            </View>
 
             <View style={styles.bottomPadding} />
           </ScrollView>
-          {keyboardVisible && editorReady && !editorLoadError && editorInputFocused && (
+          {editorReady && !editorLoadError && keyboardPhase === 'visible' && (
             <View
+              ref={keyboardToolbarRef}
               style={styles.keyboardToolbar}
               onLayout={(event) => {
                 const height = event.nativeEvent.layout.height;
                 if (height !== keyboardToolbarHeightRef.current) {
                   keyboardToolbarHeightRef.current = height;
-                  ensureCaretVisible();
+                  scheduleReveal();
                 }
               }}
             >
@@ -1084,6 +2015,33 @@ export const EditorScreen: React.FC = () => {
           )}
         </View>
       </KeyboardAvoidingView>
+
+      {__DEV__ && KEYBOARD_TRACE_ENABLED && debugKeyboardTraceVisible && debugKeyboardTrace && (
+        <View pointerEvents="box-none" style={styles.keyboardTraceOverlay}>
+          <View style={styles.keyboardTraceCard}>
+            <View style={styles.keyboardTraceHeader}>
+              <Text style={styles.keyboardTraceTitle}>{debugKeyboardTraceTitle}</Text>
+              <TouchableOpacity
+                accessibilityLabel="关闭键盘诊断"
+                onPress={() => {
+                  debugKeyboardTraceVisibleRef.current = false;
+                  setDebugKeyboardTraceVisible(false);
+                }}
+                style={styles.keyboardTraceClose}
+              >
+                <Text style={styles.keyboardTraceCloseText}>关闭</Text>
+              </TouchableOpacity>
+            </View>
+            <ScrollView
+              style={styles.keyboardTraceScroll}
+              nestedScrollEnabled
+              showsVerticalScrollIndicator
+            >
+              <Text selectable style={styles.keyboardTraceText}>{debugKeyboardTrace}</Text>
+            </ScrollView>
+          </View>
+        </View>
+      )}
 
       {/* Draft restore dialog */}
       <StyledDialog
@@ -1180,6 +2138,7 @@ export const EditorScreen: React.FC = () => {
             try {
               const draftId = getDraftId(diaryId);
               await deleteDraft(draftId);
+              await cleanupStagedMediaAfterCancel();
             } catch (error) {
               console.error('Failed to delete draft on discard:', error);
             }
@@ -1310,7 +2269,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: TEXT_PRIMARY,
     paddingVertical: 0,
-    paddingHorizontal: 4,
+    paddingHorizontal: 18,
     borderWidth: 0,
     backgroundColor: 'transparent',
     height: 40,
@@ -1398,5 +2357,50 @@ const styles = StyleSheet.create({
     backgroundColor: PAPER_BG,
     borderTopWidth: 1,
     borderTopColor: 'rgba(196, 112, 48, 0.12)',
+  },
+  keyboardTraceOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 50,
+    elevation: 50,
+    paddingTop: 6,
+    paddingHorizontal: 12,
+  },
+  keyboardTraceCard: {
+    maxHeight: '52%',
+    backgroundColor: 'rgba(35, 27, 22, 0.94)',
+    borderRadius: 8,
+    overflow: 'hidden',
+  },
+  keyboardTraceHeader: {
+    minHeight: 34,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.18)',
+  },
+  keyboardTraceTitle: {
+    color: '#fff5e8',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  keyboardTraceClose: {
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  keyboardTraceCloseText: {
+    color: '#ffd7a8',
+    fontSize: 12,
+  },
+  keyboardTraceScroll: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  keyboardTraceText: {
+    color: '#fff5e8',
+    fontSize: 10,
+    lineHeight: 15,
+    fontFamily: 'monospace',
   },
 });

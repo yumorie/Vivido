@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useRef, useMemo } from 'react';
-import { View, FlatList, StyleSheet, TouchableOpacity, Text, RefreshControl, ActivityIndicator, Dimensions } from 'react-native';
+import { View, FlatList, StyleSheet, TouchableOpacity, Text, RefreshControl, ActivityIndicator, Dimensions, InteractionManager } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -83,7 +83,14 @@ export const HomeScreen: React.FC = () => {
   useFocusEffect(
     useCallback(() => {
       currentPageRef.current = 0;
-      loadDiariesPage(0, true);
+      let cancelled = false;
+      const task = InteractionManager.runAfterInteractions(() => {
+        if (!cancelled) void loadDiariesPage(0, true);
+      });
+      return () => {
+        cancelled = true;
+        task.cancel();
+      };
     }, [loadDiariesPage])
   );
 

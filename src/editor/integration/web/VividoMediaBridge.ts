@@ -60,15 +60,43 @@ const createMediaNode = (mediaType: VividoMediaType) =>
       ];
     },
     renderHTML({ HTMLAttributes }) {
-      const label = mediaType === 'image' ? '图片' : mediaType === 'audio' ? '录音' : '视频';
       return [
         'div',
         mergeAttributes(HTMLAttributes, {
           'data-vivido-media-type': mediaType,
-          'data-vivido-media-label': label,
           class: `vivido-media vivido-media-${mediaType}`,
         }),
       ];
+    },
+    addNodeView() {
+      return ({ node }) => {
+        const dom = document.createElement('div');
+        dom.className = `vivido-media vivido-media-${mediaType}`;
+        dom.setAttribute('data-vivido-media-type', mediaType);
+        if (mediaType === 'image' && typeof node.attrs.alt === 'string') {
+          dom.setAttribute('data-vivido-media-alt', node.attrs.alt);
+        }
+        if (typeof node.attrs.mediaId === 'string' && mediaIdPattern.test(node.attrs.mediaId)) {
+          dom.setAttribute('data-vivido-media-id', node.attrs.mediaId);
+        }
+        return {
+          dom,
+          // Runtime preview children are not document content. Ignore their
+          // DOM mutations so ProseMirror never creates a transaction from them.
+          ignoreMutation: () => true,
+          update: (updatedNode) => {
+            if (updatedNode.type.name !== node.type.name) return false;
+            const nextId = updatedNode.attrs.mediaId;
+            if (typeof nextId === 'string' && mediaIdPattern.test(nextId)) {
+              dom.setAttribute('data-vivido-media-id', nextId);
+            }
+            return true;
+          },
+          destroy: () => {
+            disconnectPreviewObservers(dom);
+          },
+        };
+      };
     },
   });
 
@@ -78,41 +106,101 @@ const videoNode = createMediaNode('video');
 
 const previewUriPattern = /^(?:file|content):\/\//i;
 let previewCache: VividoMediaPreview[] = [];
-let previewObserver: MutationObserver | null = null;
-let previewObserverTarget: Element | null = null;
-let previewRefreshQueued = false;
+const previewResizeObservers = new WeakMap<HTMLElement, ResizeObserver>();
 
 const isSafePreviewUri = (uri: string | undefined): uri is string =>
   Boolean(uri && previewUriPattern.test(uri) && !/^data:/i.test(uri));
 
-const syncNaturalImageSize = (image: HTMLImageElement) => {
-  const apply = () => {
-    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
-      image.style.aspectRatio = `${image.naturalWidth} / ${image.naturalHeight}`;
-      image.style.height = 'auto';
-    }
-  };
+const fitPreviewImage = (image: HTMLImageElement, maxHeight: number) => {
+  const container = image.parentElement;
+  if (!container || image.naturalWidth <= 0 || image.naturalHeight <= 0) return;
+  const availableWidth = container.clientWidth;
+  if (availableWidth <= 0) return;
+  const ratio = image.naturalWidth / image.naturalHeight;
+  let renderedWidth = Math.min(image.naturalWidth, availableWidth);
+  let renderedHeight = renderedWidth / ratio;
+  if (renderedHeight > maxHeight) {
+    renderedHeight = maxHeight;
+    renderedWidth = renderedHeight * ratio;
+  }
+  image.style.width = `${Math.max(1, Math.round(renderedWidth))}px`;
+  image.style.height = `${Math.max(1, Math.round(renderedHeight))}px`;
+  image.style.aspectRatio = `${image.naturalWidth} / ${image.naturalHeight}`;
+};
+
+const syncNaturalImageSize = (image: HTMLImageElement, maxHeight: number) => {
+  const apply = () => fitPreviewImage(image, maxHeight);
   image.addEventListener('load', apply, { once: true });
   apply();
+  if (typeof ResizeObserver !== 'undefined' && image.parentElement) {
+    const observer = new ResizeObserver(apply);
+    observer.observe(image.parentElement);
+    previewResizeObservers.set(image, observer);
+  }
+};
+
+const disconnectPreviewObservers = (content: HTMLElement) => {
+  content.querySelectorAll<HTMLImageElement>('img').forEach((image) => {
+    previewResizeObservers.get(image)?.disconnect();
+    previewResizeObservers.delete(image);
+  });
 };
 
 /** Read-only caret geometry for the native outer-scroll visibility helper. */
-const readCaretRect = () => {
-  const selection = window.getSelection();
+const readCaretRect = (editor: Editor) => {
   const editorElement = document.querySelector<HTMLElement>('.ProseMirror');
-  if (!selection || !editorElement || selection.rangeCount === 0 || !selection.isCollapsed) {
+  const pmSelection = editor.state.selection;
+  if (!editorElement || !pmSelection.empty || !('$cursor' in pmSelection)) {
+    return null;
+  }
+  const editorRect = editorElement.getBoundingClientRect();
+
+  // ProseMirror's own coordinate API handles an empty paragraph/collapsed
+  // caret even when the browser Range has zero height. It is read-only: no
+  // selection or transaction is created here.
+  try {
+    const coords = editor.view.coordsAtPos(editor.state.selection.head, 1);
+    if (Number.isFinite(coords.top) && Number.isFinite(coords.bottom)) {
+      return {
+        top: coords.top - editorRect.top,
+        bottom: coords.bottom - editorRect.top,
+        height: Math.max(1, coords.bottom - coords.top),
+      };
+    }
+  } catch {
+    // The DOM Range fallback below is useful during WebView teardown.
+  }
+
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0 || !selection.isCollapsed) {
     return null;
   }
   const range = selection.getRangeAt(0).cloneRange();
   range.collapse(true);
   const rect = range.getBoundingClientRect();
-  const editorRect = editorElement.getBoundingClientRect();
-  if (rect.height <= 0) return null;
-  return {
-    top: rect.top - editorRect.top,
-    bottom: rect.bottom - editorRect.top,
-    height: rect.height,
-  };
+  if (rect.height > 0) {
+    return {
+      top: rect.top - editorRect.top,
+      bottom: rect.bottom - editorRect.top,
+      height: rect.height,
+    };
+  }
+
+  // Android WebView may report a zero-height Range in an empty paragraph.
+  // Use that paragraph's actual box only as a geometry fallback.
+  const anchor = selection.anchorNode instanceof Element
+    ? selection.anchorNode
+    : selection.anchorNode?.parentElement;
+  const block = anchor?.closest('.ProseMirror p');
+  const blockRect = block?.getBoundingClientRect();
+  if (blockRect && blockRect.height > 0) {
+    return {
+      top: blockRect.top - editorRect.top,
+      bottom: blockRect.bottom - editorRect.top,
+      height: blockRect.height,
+    };
+  }
+  return null;
 };
 
 const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
@@ -150,6 +238,7 @@ const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
       if (!needsImagePreview && !needsVideoPreview &&
           !(needsFallbackPreview && !content.querySelector('.vivido-media-fallback'))) return;
     }
+    disconnectPreviewObservers(content);
     while (content.firstChild) content.removeChild(content.firstChild);
     if (!preview || preview.mediaType !== mediaType) {
       const fallback = document.createElement('span');
@@ -162,18 +251,14 @@ const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
       image.src = preview.uri;
       image.alt = preview.label ?? '图片';
       content.appendChild(image);
-      syncNaturalImageSize(image);
+      syncNaturalImageSize(image, 360);
     } else if (mediaType === 'video' && isSafePreviewUri(preview.thumbnailUri)) {
       const image = document.createElement('img');
       image.className = 'vivido-media-preview vivido-media-video-preview';
       image.src = preview.thumbnailUri;
       image.alt = preview.label ?? '视频缩略图';
       content.appendChild(image);
-      syncNaturalImageSize(image);
-      const badge = document.createElement('span');
-      badge.className = 'vivido-media-badge';
-      badge.textContent = '视频';
-      content.appendChild(badge);
+      syncNaturalImageSize(image, 260);
     } else {
       const fallback = document.createElement('span');
       fallback.className = 'vivido-media-label vivido-media-fallback';
@@ -182,24 +267,6 @@ const renderPreviewCards = (previews: VividoMediaPreview[], force = true) => {
     }
 
   });
-};
-
-const observePreviewDom = () => {
-  const target = document.querySelector('.ProseMirror');
-  if (target === previewObserverTarget) return;
-  previewObserver?.disconnect();
-  previewObserverTarget = target;
-  previewObserver = target
-    ? new MutationObserver(() => {
-        if (previewRefreshQueued) return;
-        previewRefreshQueued = true;
-        Promise.resolve().then(() => {
-          previewRefreshQueued = false;
-          renderPreviewCards(previewCache, false);
-        });
-      })
-    : null;
-  previewObserver?.observe(target!, { childList: true, subtree: true });
 };
 
 const insertMedia = (editor: Editor, mediaType: VividoMediaType, mediaId: string) => {
@@ -245,25 +312,23 @@ const vividoMediaBridge = new BridgeExtension<
       // Preview updates are DOM-only runtime state; they do not create a
       // ProseMirror transaction and therefore cannot enter history/markup.
       previewCache = message.payload.previews;
-      observePreviewDom();
       renderPreviewCards(previewCache);
       return true;
     }
     return false;
   },
   extendCSS: `
-    .vivido-media { display: block; min-height: 72px; margin: 8px 0; padding: 10px; box-sizing: border-box; }
+    .vivido-media { display: block; margin: 10px 0; box-sizing: border-box; }
     .vivido-media-image, .vivido-media-audio, .vivido-media-video {
-      border: 1px solid currentColor;
-      border-radius: 8px;
       position: relative;
+      border-radius: 8px;
     }
     .vivido-media-content { display: flex; min-width: 0; min-height: 48px; align-items: center; gap: 8px; }
     .vivido-media-image .vivido-media-content, .vivido-media-video .vivido-media-content {
       flex-direction: column; align-items: stretch; gap: 6px;
     }
     .vivido-media-audio .vivido-media-content { flex-direction: row; align-items: center; }
-    .vivido-media-label, .vivido-media-badge { display: inline-block; }
+    .vivido-media-label { display: inline-block; }
     .vivido-media-label { font-size: 15px; font-weight: 600; }
     .vivido-media-fallback {
       min-height: 48px; padding: 10px 12px; box-sizing: border-box;
@@ -272,12 +337,19 @@ const vividoMediaBridge = new BridgeExtension<
     .vivido-media-preview { display: block; width: auto; height: auto; max-width: 100%; object-fit: contain; object-position: center; align-self: center; }
     .vivido-media-image-preview { max-width: 100%; max-height: 360px; }
     .vivido-media-video-preview { max-width: 100%; max-height: 260px; }
-    .vivido-media-badge {
-      position: absolute; left: 18px; bottom: 16px; padding: 3px 7px;
-      border-radius: 5px; background: rgba(0,0,0,.62); color: #fff; font-size: 14px;
+    .vivido-media-video .vivido-media-content::after {
+      content: '▶'; position: absolute; left: 50%; top: 50%;
+      transform: translate(-50%, -50%); width: 42px; height: 42px;
+      border-radius: 21px; display: grid; place-items: center;
+      padding-left: 2px; box-sizing: border-box;
+      background: rgba(61,44,30,.72); color: #f5f0e6; font-size: 18px;
+    }
+    .ProseMirror-selectednode {
+      outline: 2px solid #c47030; outline-offset: 2px;
+      box-shadow: 0 0 0 3px rgba(196,112,48,.18); border-radius: 8px;
     }
   `,
-  extendEditorState: () => ({ caretRect: readCaretRect() }),
+  extendEditorState: (editor) => ({ caretRect: readCaretRect(editor) }),
 });
 
 // TenTap 1.0.1 derives the bridge name from tiptapExtension and ignores

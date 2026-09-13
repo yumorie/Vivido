@@ -184,8 +184,6 @@ export const TimelineCard: React.FC<TimelineCardProps> = ({ diary, onPress }) =>
           <View style={styles.mediaContainer}>
             <VideoPoster
               thumbnailUri={videos[0].thumbnail}
-              videoUri={videos[0].uri}
-              enableGeneratedThumbnail
               style={styles.singleMedia}
             />
           </View>

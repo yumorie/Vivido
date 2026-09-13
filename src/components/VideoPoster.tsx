@@ -1,102 +1,21 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Platform, StyleProp, StyleSheet, Text, View, ViewStyle } from 'react-native';
+import React from 'react';
+import { StyleProp, StyleSheet, Text, View, ViewStyle } from 'react-native';
 import { Image } from 'expo-image';
-import { createVideoPlayer } from 'expo-video';
-import type { SharedRefType } from 'expo';
 
 interface VideoPosterProps {
   thumbnailUri?: string;
-  videoUri?: string;
   style?: StyleProp<ViewStyle>;
   label?: string;
-  enableGeneratedThumbnail?: boolean;
   onAspectRatioChange?: (aspectRatio: number) => void;
 }
 
 export const VideoPoster: React.FC<VideoPosterProps> = ({
   thumbnailUri,
-  videoUri,
   style,
   label = '视频',
-  enableGeneratedThumbnail = false,
   onAspectRatioChange,
 }) => {
-  const shouldGenerateThumbnail =
-    enableGeneratedThumbnail && !thumbnailUri && Boolean(videoUri) && Platform.OS !== 'web';
-  const [generatedThumbnail, setGeneratedThumbnail] = useState<SharedRefType<'image'> | null>(null);
-  const generatedThumbnailRef = useRef<SharedRefType<'image'> | null>(null);
-
-  const replaceGeneratedThumbnail = useCallback((nextThumbnail: SharedRefType<'image'> | null) => {
-    const previousThumbnail = generatedThumbnailRef.current as { release?: () => void } | null;
-
-    if (previousThumbnail && previousThumbnail !== nextThumbnail) {
-      previousThumbnail.release?.();
-    }
-
-    generatedThumbnailRef.current = nextThumbnail;
-    setGeneratedThumbnail(nextThumbnail);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    let player: ReturnType<typeof createVideoPlayer> | null = null;
-    let playerReleased = false;
-    const releasePlayer = () => {
-      if (player && !playerReleased) {
-        player.release();
-        playerReleased = true;
-      }
-      player = null;
-    };
-
-    if (!shouldGenerateThumbnail) {
-      replaceGeneratedThumbnail(null);
-      return;
-    }
-
-    const generateThumbnail = async () => {
-      try {
-        player = createVideoPlayer(videoUri!);
-        playerReleased = false;
-        const thumbnails = await player.generateThumbnailsAsync([0.1], {
-          maxWidth: 1200,
-          maxHeight: 1200,
-        });
-
-        const firstThumbnail = thumbnails[0] ?? null;
-        releasePlayer();
-
-        if (cancelled) {
-          (firstThumbnail as { release?: () => void } | null)?.release?.();
-          return;
-        }
-
-        replaceGeneratedThumbnail(firstThumbnail);
-      } catch (error) {
-        releasePlayer();
-        if (!cancelled) {
-          replaceGeneratedThumbnail(null);
-        }
-      }
-    };
-
-    generateThumbnail();
-
-    return () => {
-      cancelled = true;
-      releasePlayer();
-    };
-  }, [replaceGeneratedThumbnail, shouldGenerateThumbnail, videoUri]);
-
-  useEffect(() => {
-    return () => {
-      const currentThumbnail = generatedThumbnailRef.current as { release?: () => void } | null;
-      currentThumbnail?.release?.();
-      generatedThumbnailRef.current = null;
-    };
-  }, []);
-
-  const imageSource = thumbnailUri ? { uri: thumbnailUri } : generatedThumbnail;
+  const imageSource = thumbnailUri ? { uri: thumbnailUri } : null;
 
   return (
     <View style={[styles.container, style]}>

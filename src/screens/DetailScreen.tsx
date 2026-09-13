@@ -210,8 +210,6 @@ export const DetailScreen: React.FC = () => {
         >
           <VideoPoster
             thumbnailUri={item.thumbnail}
-            videoUri={item.uri}
-            enableGeneratedThumbnail
             style={styles.mediaImage}
           />
         </TouchableOpacity>

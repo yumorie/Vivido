@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -17,16 +17,27 @@ interface TagEditorProps {
   selectedTags: Tag[];
   onTagsChange: (tags: Tag[]) => void;
   onInputFocus?: (focused: boolean) => void;
+  /** Bottom edge of the actual TextInput, relative to this TagEditor. */
+  onInputLayout?: (bottomWithinTagEditor: number) => void;
 }
 
 export const TagEditor: React.FC<TagEditorProps> = ({
   selectedTags,
   onTagsChange,
   onInputFocus,
+  onInputLayout,
 }) => {
   const [allTags, setAllTags] = useState<TagSuggestion[]>([]);
   const [showInput, setShowInput] = useState(false);
   const [newTagName, setNewTagName] = useState('');
+  const inputRowTopRef = useRef(0);
+  const inputGeometryRef = useRef<{ y: number; height: number } | null>(null);
+  const reportInputLayout = useCallback(() => {
+    const geometry = inputGeometryRef.current;
+    if (geometry) {
+      onInputLayout?.(inputRowTopRef.current + geometry.y + geometry.height);
+    }
+  }, [onInputLayout]);
 
   // Reload tags when screen comes into focus (e.g., after returning from deleting a tag)
   useFocusEffect(
@@ -109,7 +120,13 @@ export const TagEditor: React.FC<TagEditorProps> = ({
       </View>
 
       {showInput && (
-        <View style={styles.inputRow}>
+        <View
+          style={styles.inputRow}
+          onLayout={(event) => {
+            inputRowTopRef.current = event.nativeEvent.layout.y;
+            reportInputLayout();
+          }}
+        >
           <TextInput
             style={styles.input}
             value={newTagName}
@@ -122,6 +139,11 @@ export const TagEditor: React.FC<TagEditorProps> = ({
             scrollEnabled={false}
             onFocus={() => onInputFocus?.(true)}
             onBlur={() => onInputFocus?.(false)}
+            onLayout={(event) => {
+              const { y, height } = event.nativeEvent.layout;
+              inputGeometryRef.current = { y, height };
+              reportInputLayout();
+            }}
             onSubmitEditing={handleCreateTag}
           />
           <TouchableOpacity
