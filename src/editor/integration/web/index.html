@@ -10,7 +10,8 @@
     <script type="module" src="./index.tsx"></script>
     <style>
       /* Must match VIVIDO_EDITOR_PAPER_BG (#f5f0e6) used by the RN editor frame. */
-      :root, html, body, #root { margin: 0; padding: 0; background: #f5f0e6; }
+      /* ProseMirror scrollIntoView can reach body/window; outer RN ScrollView is the sole vertical owner. */
+      :root, html, body, #root { margin: 0; padding: 0; background: #f5f0e6; overflow: hidden; }
       body {
         color: #3d2c1e;
         font-family: system-ui, -apple-system, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
