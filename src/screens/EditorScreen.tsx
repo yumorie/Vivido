@@ -594,9 +594,10 @@ export const EditorScreen: React.FC = () => {
     const generation = resumeFocusGenerationRef.current;
     foregroundRecoveryActiveRef.current = true;
     foregroundRecoveryKeepToolbarRef.current = true;
-    // The toolbar is intentionally hidden until the window-focus handoff (or
-    // the bounded fallback) starts the controlled restore.
-    setKeyboardPhaseStable('hidden');
+    // The captured pre-background keyboard-open intent is a temporary,
+    // responsive toolbar hold.  The bounded restore outcome below still
+    // settles it to hidden if the IME does not actually return.
+    setKeyboardPhaseStable('visible');
     resumeFocusFallbackTimerRef.current = setTimeout(() => {
       resumeFocusFallbackTimerRef.current = null;
       if (generation === resumeFocusGenerationRef.current) attemptResumeEditorFocus();
@@ -717,6 +718,25 @@ export const EditorScreen: React.FC = () => {
       setKeyboardPhaseStable('hidden');
     }
   }, [cancelResumeEditorFocus, recordLifecycleEvent, setKeyboardPhaseStable]);
+
+  const resetEditorKeyboardSession = useCallback(() => {
+    // A real didShow starts a new IME session.  It must not inherit a
+    // lifecycle blur that was pending when a closed editor went background.
+    cancelResumeEditorFocus();
+    lifecycleBlurGenerationRef.current += 1;
+    lifecycleBlurPendingRef.current = false;
+    lifecycleBlurAckRef.current = false;
+    lifecycleBlurSentRef.current = false;
+    foregroundRecoveryActiveRef.current = false;
+    foregroundRecoveryKeepToolbarRef.current = false;
+    editorKeyboardReturnIntentRef.current = true;
+    resumeBridgeFocusEvidenceRef.current = false;
+    keyboardPositiveEvidenceRef.current = true;
+    keyboardHiddenEvidenceRef.current = false;
+    keyboardHidePendingRef.current = false;
+    keyboardFullHeightStableCountRef.current = 0;
+    recordLifecycleEvent('keyboard-session-reset');
+  }, [cancelResumeEditorFocus, recordLifecycleEvent]);
 
   const runPendingReveal = useCallback(() => {
     const pending = pendingRevealRef.current;
@@ -1108,6 +1128,7 @@ export const EditorScreen: React.FC = () => {
       if (appStateRef.current !== 'active') return;
       if (appStateRef.current === 'active') Keyboard.scheduleLayoutAnimation(event);
       if (editorInputOwnerRef.current === 'editor') {
+        resetEditorKeyboardSession();
         if (lifecycleBlurPendingRef.current && !editorKeyboardReturnIntentRef.current) {
           setKeyboardPhaseStable('hidden');
           return;
@@ -1149,14 +1170,19 @@ export const EditorScreen: React.FC = () => {
         if (foregroundRecoveryActiveRef.current && editorKeyboardReturnIntentRef.current) {
           // A keyboardDidHide delivered during the bounded foreground handoff
           // can belong to the pre-background WebView session. Keep the
-          // return intent and let a later positive signal (or the bounded
-          // recovery outcome) classify this event.
+          // toolbar and return intent; later positive evidence (or the bounded
+          // recovery outcome) classifies this event.
           keyboardHidePendingRef.current = true;
           keyboardHiddenEvidenceRef.current = false;
           scheduleActiveSync();
           return;
         }
         // A hide is only a candidate; root full-height measurements confirm it.
+        // Hide the toolbar immediately.  A stale editor/WebView focus must not
+        // keep a formatting bar visible after the IME has actually closed;
+        // later resize/show evidence may mount it again for a real reopen.
+        keyboardPositiveEvidenceRef.current = false;
+        setKeyboardPhaseStable('hidden');
         resumeBridgeFocusEvidenceRef.current = false;
         keyboardHidePendingRef.current = true;
         keyboardHiddenEvidenceRef.current = false;
@@ -1309,6 +1335,7 @@ export const EditorScreen: React.FC = () => {
     confirmResumeEditorFocus,
     handleEditorRootLayout,
     recordLifecycleEvent,
+    resetEditorKeyboardSession,
     revealKeyboardToolbarAfterLayout,
     scheduleColdKeyboardTrace,
     scheduleLifecycleTraceSummary,
@@ -1903,6 +1930,13 @@ export const EditorScreen: React.FC = () => {
   const dateObj = parseDateInputValue(date)
     ? new Date(parseDateInputValue(date)!)
     : new Date();
+  const shouldShowEditorToolbar = editorReady && !editorLoadError && keyboardPhase === 'visible';
+  useEffect(() => {
+    recordLifecycleEvent(
+      'toolbar-render-decision',
+      `show=${shouldShowEditorToolbar ? 1 : 0}|phase=${keyboardPhase}|owner=${editorInputOwnerRef.current ?? 'none'}|positive=${keyboardPositiveEvidenceRef.current ? 1 : 0}`,
+    );
+  }, [keyboardPhase, recordLifecycleEvent, shouldShowEditorToolbar]);
 
   return (
     <SafeAreaView style={styles.mainContainer} edges={['top']}>
@@ -2180,7 +2214,7 @@ export const EditorScreen: React.FC = () => {
 
             <View style={styles.bottomPadding} />
           </ScrollView>
-          {editorReady && !editorLoadError && keyboardPhase === 'visible' && (
+          {shouldShowEditorToolbar && (
             <View
               ref={keyboardToolbarRef}
               style={styles.keyboardToolbar}
