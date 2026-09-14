@@ -147,7 +147,7 @@ const disconnectPreviewObservers = (content: HTMLElement) => {
 };
 
 /** Read-only caret geometry for the native outer-scroll visibility helper. */
-const readCaretRect = (editor: Editor) => {
+function readCaretRect(editor: Editor) {
   const editorElement = document.querySelector<HTMLElement>('.ProseMirror');
   const pmSelection = editor.state.selection;
   if (!editorElement || !pmSelection.empty || !('$cursor' in pmSelection)) {
@@ -318,10 +318,13 @@ const vividoMediaBridge = new BridgeExtension<
     return false;
   },
   extendCSS: `
-    .vivido-media { display: block; margin: 10px 0; box-sizing: border-box; }
+    .vivido-media {
+      display: block; width: 100%; margin: 10px 0; box-sizing: border-box;
+      border-radius: 8px; overflow: hidden;
+    }
     .vivido-media-image, .vivido-media-audio, .vivido-media-video {
       position: relative;
-      border-radius: 8px;
+      border-radius: 8px; overflow: hidden;
     }
     .vivido-media-content { display: flex; min-width: 0; min-height: 48px; align-items: center; gap: 8px; }
     .vivido-media-image .vivido-media-content, .vivido-media-video .vivido-media-content {
@@ -345,8 +348,18 @@ const vividoMediaBridge = new BridgeExtension<
       background: rgba(61,44,30,.72); color: #f5f0e6; font-size: 18px;
     }
     .ProseMirror-selectednode {
-      outline: 2px solid #c47030; outline-offset: 2px;
-      box-shadow: 0 0 0 3px rgba(196,112,48,.18); border-radius: 8px;
+      outline: none;
+      box-shadow: inset 0 0 0 2px rgba(196,112,48,.72),
+        inset 0 0 0 4px rgba(196,112,48,.12);
+      border-radius: 8px;
+    }
+    .ProseMirror .vivido-media.ProseMirror-selectednode {
+      outline: none !important;
+      border: none !important;
+      box-shadow: inset 0 0 0 2px rgba(196,112,48,.72),
+        inset 0 0 0 4px rgba(196,112,48,.12) !important;
+      border-radius: 8px;
+      overflow: hidden;
     }
   `,
   extendEditorState: (editor) => ({ caretRect: readCaretRect(editor) }),

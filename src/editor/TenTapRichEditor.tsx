@@ -27,6 +27,8 @@ export interface RichEditorHostProps {
   onDirty?: () => void;
   onStateChange?: (state: Readonly<RichEditorActiveState>) => void;
   onFocusChange?: (focused: boolean) => void;
+  /** A user interaction hint; caret geometry still comes from bridge state. */
+  onInteraction?: () => void;
   showToolbar?: boolean;
 }
 
@@ -37,6 +39,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
     onDirty,
     onStateChange,
     onFocusChange,
+    onInteraction,
     showToolbar = true,
   }, ref) {
     const onDirtyRef = useRef(onDirty);
@@ -45,6 +48,8 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
     onStateChangeRef.current = onStateChange;
     const onFocusChangeRef = useRef(onFocusChange);
     onFocusChangeRef.current = onFocusChange;
+    const onInteractionRef = useRef(onInteraction);
+    onInteractionRef.current = onInteraction;
     const controlledLoadGenerationRef = useRef<number | null>(null);
     const onChange = useCallback(() => {
       if (controlledLoadGenerationRef.current !== null) {
@@ -87,6 +92,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
       adapterRef.current = createRichEditorAdapter(() => editorRef.current);
     }
     const adapter = adapterRef.current;
+
     const onReadyRef = useRef(onReady);
     onReadyRef.current = onReady;
     const loadGenerationRef = useRef(0);
@@ -206,6 +212,7 @@ export const RichEditorHost = forwardRef<RichEditorAdapter, RichEditorHostProps>
       [],
     );
     const handleEditorInteraction = useCallback(() => {
+      onInteractionRef.current?.();
       onFocusChangeRef.current?.(true);
     }, []);
 

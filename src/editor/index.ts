@@ -1,6 +1,10 @@
 export { RichEditorHost, RichEditorToolbar } from './TenTapRichEditor';
 export type { RichEditorHostProps, RichEditorToolbarProps } from './TenTapRichEditor';
-export type { RichEditorAdapter, RichEditorActiveState, RichEditorCaretRect } from './RichEditorAdapter';
+export type {
+  RichEditorAdapter,
+  RichEditorActiveState,
+  RichEditorCaretRect,
+} from './RichEditorAdapter';
 export { VIVIDO_EDITOR_PAPER_BG } from './editorTheme';
 export {
   collectMediaIds,

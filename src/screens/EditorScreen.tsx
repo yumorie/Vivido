@@ -3,12 +3,14 @@ import {
   View,
   Text,
   TextInput,
+  Modal,
   StyleSheet,
   TouchableOpacity,
   KeyboardAvoidingView,
   Keyboard,
   AppState,
   Dimensions,
+  PixelRatio,
   Platform,
   ScrollView,
   StatusBar,
@@ -19,9 +21,10 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import * as ImagePicker from 'expo-image-picker';
 import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 import type { ImageManipulatorContext, ImageRef } from 'expo-image-manipulator';
+import { cacheDirectory, writeAsStringAsync, deleteAsync } from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
 import { createVideoPlayer } from 'expo-video';
 import type { SharedRefType } from 'expo';
-import { deleteAsync } from 'expo-file-system/legacy';
 import { DatePickerModal } from '../components/DatePickerModal';
 import { RootStackParamList, DiaryEntry, MediaItem, Tag } from '../types';
 import { getDiaryById, createDiary, updateDiary, saveDraft, getDraft, deleteDraft, isMediaReferenced, Draft } from '../services/database';
@@ -53,10 +56,11 @@ type PendingReveal = {
   bottom: number;
 };
 type KeyboardTraceEvent = { endCoordinates: { screenY: number; height: number } };
+type LayoutFrame = { x: number; y: number; width: number; height: number };
 
-// Kept as an opt-in diagnostic for future device investigations. Production
-// and normal development runs must not collect, render, or log keyboard traces.
-const KEYBOARD_TRACE_ENABLED = false;
+// Development-only bounded diagnostic. It records no document or selection
+// content; the UI remains closed until the developer explicitly opens Trace.
+const KEYBOARD_TRACE_ENABLED = __DEV__;
 
 const PAPER_BG = VIVIDO_EDITOR_PAPER_BG;
 const TEXT_PRIMARY = '#3d2c1e';
@@ -161,6 +165,7 @@ export const EditorScreen: React.FC = () => {
   const [debugKeyboardTrace, setDebugKeyboardTrace] = useState<string | null>(null);
   const [debugKeyboardTraceVisible, setDebugKeyboardTraceVisible] = useState(false);
   const [debugKeyboardTraceTitle, setDebugKeyboardTraceTitle] = useState('VIVIDO_KEYBOARD_TRACE');
+  const [debugKeyboardTraceError, setDebugKeyboardTraceError] = useState<string | null>(null);
   const [editorLoadError, setEditorLoadError] = useState<string | null>(null);
   const [editorMountKey, setEditorMountKey] = useState(0);
   const [entryLoaded, setEntryLoaded] = useState(!isEditing);
@@ -235,6 +240,7 @@ export const EditorScreen: React.FC = () => {
   const suppressRevealAfterManualScrollRef = useRef(false);
   const lastCaretGeometryRef = useRef<{ top: number; bottom: number } | null>(null);
   const inputRevealRequestedRef = useRef(false);
+  const explicitCaretRevealRequestedRef = useRef(false);
   const lastRevealCommandRef = useRef<{
     kind: PendingReveal['kind'];
     target: number;
@@ -278,6 +284,7 @@ export const EditorScreen: React.FC = () => {
   const appStateRef = useRef(AppState.currentState ?? 'active');
   const lifecycleEventRingRef = useRef<string[]>([]);
   const lifecycleTraceStartedAtRef = useRef<number | null>(null);
+  const lifecycleTraceLastElapsedRef = useRef(-1);
   const lifecycleTraceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const coldKeyboardTraceCapturedRef = useRef(false);
   const coldKeyboardTraceGenerationRef = useRef(0);
@@ -288,7 +295,13 @@ export const EditorScreen: React.FC = () => {
   const editorRootRef = useRef<View | null>(null);
   const keyboardAvoidingViewRef = useRef<KeyboardAvoidingView | null>(null);
   const keyboardToolbarRef = useRef<View | null>(null);
+  const editorRootFrameRef = useRef<LayoutFrame | null>(null);
+  const kavFrameRef = useRef<LayoutFrame | null>(null);
+  const scrollFrameRef = useRef<LayoutFrame | null>(null);
+  const toolbarFrameRef = useRef<LayoutFrame | null>(null);
+  const lastLoggedScrollOffsetRef = useRef(0);
   const safeAreaTopRef = useRef(insets.top);
+  const safeAreaBottomRef = useRef(insets.bottom);
   const windowScreenTopRef = useRef(Platform.OS === 'android' ? (StatusBar.currentHeight ?? 0) : 0);
   const keyboardAvoidingOffsetRef = useRef(
     Platform.OS === 'android'
@@ -296,6 +309,7 @@ export const EditorScreen: React.FC = () => {
       : 0,
   );
   safeAreaTopRef.current = insets.top;
+  safeAreaBottomRef.current = insets.bottom;
   windowScreenTopRef.current = Platform.OS === 'android' ? (StatusBar.currentHeight ?? 0) : 0;
   keyboardAvoidingOffsetRef.current = Platform.OS === 'android'
     ? Math.max((StatusBar.currentHeight ?? 0) - insets.top, 0)
@@ -303,20 +317,93 @@ export const EditorScreen: React.FC = () => {
   editorReadyRef.current = editorReady;
   latestCaretRectRef.current = editorActiveState.caretRect;
 
-  const recordLifecycleEvent = useCallback((event: string) => {
+  const recordLifecycleEvent = useCallback((event: string, detail = '') => {
     if (!__DEV__ || !KEYBOARD_TRACE_ENABLED) return;
     const metricsHeight = typeof Keyboard.metrics === 'function' ? (Keyboard.metrics()?.height ?? 0) : 0;
     const startedAt = lifecycleTraceStartedAtRef.current ?? Date.now();
-    const snapshot = `+${Date.now() - startedAt}ms ${event}|app=${appStateRef.current}|phase=${keyboardPhaseRef.current}|owner=${editorInputOwnerRef.current ?? 'none'}|intent=${editorKeyboardReturnIntentRef.current ? 1 : 0}|positive=${keyboardPositiveEvidenceRef.current ? 1 : 0}|hidePending=${keyboardHidePendingRef.current ? 1 : 0}|inactive=${lifecycleInactiveRef.current ? 1 : 0}|blurPending=${lifecycleBlurPendingRef.current ? 1 : 0}|blurAck=${lifecycleBlurAckRef.current ? 1 : 0}|resumeSent=${resumeFocusSentRef.current ? 1 : 0}|bridgeEvidence=${resumeBridgeFocusEvidenceRef.current ? 1 : 0}|ime=${Keyboard.isVisible() ? 1 : 0}|metrics=${Math.round(metricsHeight)}|baseline=${keyboardBaselineHeightRef.current === null ? 'null' : Math.round(keyboardBaselineHeightRef.current)}|root=${Math.round(keyboardCurrentHeightRef.current)}`;
+    const windowSize = Dimensions.get('window');
+    const formatFrame = (frame: LayoutFrame | null) => frame
+      ? `${Math.round(frame.x)},${Math.round(frame.y)},${Math.round(frame.width)}x${Math.round(frame.height)}`
+      : 'null';
+    const pending = pendingRevealRef.current;
+    const caret = latestCaretRectRef.current;
+    const targetTop = pending?.kind === 'caret' && caret
+      ? editorAreaTopRef.current + editorHostTopRef.current + caret.top
+      : pending?.top ?? null;
+    const targetBottom = pending?.kind === 'caret' && caret
+      ? editorAreaTopRef.current + editorHostTopRef.current + caret.bottom
+      : pending?.bottom ?? null;
+    const elapsed = Math.max(Date.now() - startedAt, lifecycleTraceLastElapsedRef.current);
+    lifecycleTraceLastElapsedRef.current = elapsed;
+    const snapshot = `+${elapsed}ms ${event}|${detail ? `${detail}|` : ''}app=${appStateRef.current}|phase=${keyboardPhaseRef.current}|owner=${editorInputOwnerRef.current ?? 'none'}|intent=${editorKeyboardReturnIntentRef.current ? 1 : 0}|positive=${keyboardPositiveEvidenceRef.current ? 1 : 0}|hidePending=${keyboardHidePendingRef.current ? 1 : 0}|inactive=${lifecycleInactiveRef.current ? 1 : 0}|blurPending=${lifecycleBlurPendingRef.current ? 1 : 0}|blurAck=${lifecycleBlurAckRef.current ? 1 : 0}|resumeSent=${resumeFocusSentRef.current ? 1 : 0}|bridgeEvidence=${resumeBridgeFocusEvidenceRef.current ? 1 : 0}|ime=${Keyboard.isVisible() ? 1 : 0}|metrics=${Math.round(metricsHeight)}|baseline=${keyboardBaselineHeightRef.current === null ? 'null' : Math.round(keyboardBaselineHeightRef.current)}|rootH=${Math.round(keyboardCurrentHeightRef.current)}|safeTop=${Math.round(safeAreaTopRef.current)}|safeBottom=${Math.round(safeAreaBottomRef.current)}|window=${Math.round(windowSize.width)}x${Math.round(windowSize.height)}|kav=${formatFrame(kavFrameRef.current)}|root=${formatFrame(editorRootFrameRef.current)}|scroll=${formatFrame(scrollFrameRef.current)}|toolbar=${formatFrame(toolbarFrameRef.current)}|offset=${Math.round(scrollOffsetRef.current)}|contentH=${Math.round(scrollContentHeightRef.current)}|viewportH=${Math.round(scrollViewportHeightRef.current)}|pending=${pending?.kind ?? 'none'}|target=${targetTop === null ? 'null' : `${Math.round(targetTop)}..${Math.round(targetBottom ?? targetTop)}`}`;
     const ring = lifecycleEventRingRef.current;
     ring.push(snapshot);
-    if (ring.length > 32) ring.shift();
+    if (ring.length > 250) ring.shift();
   }, []);
+
+  const recordRevealDecision = useCallback((reason: string, detail = '') => {
+    recordLifecycleEvent(`reveal:${reason}`, detail);
+  }, [recordLifecycleEvent]);
+
+  const getDebugTraceSnapshot = useCallback((includeLastSummary = true) => {
+    const windowSize = Dimensions.get('window');
+    const screenSize = Dimensions.get('screen');
+    const metadata = `platform=${Platform.OS}|version=${String(Platform.Version)}|pixelRatio=${PixelRatio.get()}|window=${Math.round(windowSize.width)}x${Math.round(windowSize.height)}|screen=${Math.round(screenSize.width)}x${Math.round(screenSize.height)}`;
+    const summary = includeLastSummary && debugKeyboardTrace
+      ? `\nlast-summary:\n${debugKeyboardTrace}`
+      : '';
+    return [`VIVIDO_KEYBOARD_TRACE`, metadata, ...lifecycleEventRingRef.current, summary].filter(Boolean).join('\n');
+  }, [debugKeyboardTrace]);
+
+  const openKeyboardTrace = useCallback(() => {
+    if (!__DEV__ || !KEYBOARD_TRACE_ENABLED) return;
+    debugKeyboardTraceVisibleRef.current = true;
+    setDebugKeyboardTraceError(null);
+    setDebugKeyboardTrace(getDebugTraceSnapshot());
+    setDebugKeyboardTraceTitle(debugKeyboardTraceTitleRef.current);
+    setDebugKeyboardTraceVisible(true);
+  }, [getDebugTraceSnapshot]);
+
+  const clearKeyboardTrace = useCallback(() => {
+    lifecycleEventRingRef.current = [];
+    lifecycleTraceStartedAtRef.current = Date.now();
+    lifecycleTraceLastElapsedRef.current = -1;
+    setDebugKeyboardTrace(getDebugTraceSnapshot(false));
+  }, [getDebugTraceSnapshot]);
+
+  const shareKeyboardTrace = useCallback(async () => {
+    if (!__DEV__ || !KEYBOARD_TRACE_ENABLED) return;
+    setDebugKeyboardTraceError(null);
+    const tracePath = cacheDirectory
+      ? `${cacheDirectory}vivido-keyboard-trace-${Date.now()}.txt`
+      : null;
+    if (!tracePath) {
+      setDebugKeyboardTraceError('无法访问临时缓存目录');
+      return;
+    }
+    try {
+      await writeAsStringAsync(tracePath, getDebugTraceSnapshot());
+      if (!(await Sharing.isAvailableAsync())) {
+        throw new Error('系统不支持文件分享');
+      }
+      await Sharing.shareAsync(tracePath, {
+        mimeType: 'text/plain',
+        dialogTitle: 'Vivido 键盘诊断日志',
+      });
+    } catch {
+      setDebugKeyboardTraceError('诊断日志分享失败，请重试');
+    } finally {
+      // The share sheet has consumed the temporary file by this point; this
+      // best-effort cleanup never touches media or business data.
+      await deleteAsync(tracePath, { idempotent: true }).catch(() => undefined);
+    }
+  }, [getDebugTraceSnapshot]);
 
   const scheduleLifecycleTraceSummary = useCallback(() => {
     if (!__DEV__ || !KEYBOARD_TRACE_ENABLED || lifecycleTraceTimerRef.current !== null) return;
     lifecycleTraceStartedAtRef.current = Date.now();
     lifecycleEventRingRef.current = [];
+    lifecycleTraceLastElapsedRef.current = -1;
     if (!(debugKeyboardTraceTitleRef.current === 'VIVIDO_COLD_KEYBOARD_TRACE'
       && debugKeyboardTraceVisibleRef.current)) {
       debugKeyboardTraceTitleRef.current = 'VIVIDO_KEYBOARD_TRACE';
@@ -335,10 +422,8 @@ export const EditorScreen: React.FC = () => {
       if (!(debugKeyboardTraceTitleRef.current === 'VIVIDO_COLD_KEYBOARD_TRACE'
         && debugKeyboardTraceVisibleRef.current)) {
         debugKeyboardTraceTitleRef.current = 'VIVIDO_KEYBOARD_TRACE';
-        debugKeyboardTraceVisibleRef.current = true;
         setDebugKeyboardTraceTitle('VIVIDO_KEYBOARD_TRACE');
         setDebugKeyboardTrace(summary);
-        setDebugKeyboardTraceVisible(true);
       }
       console.warn(`VIVIDO_KEYBOARD_TRACE ${summary}`);
       lifecycleTraceStartedAtRef.current = null;
@@ -378,6 +463,7 @@ export const EditorScreen: React.FC = () => {
         const screenSize = Dimensions.get('screen');
         const keyboardTop = event.endCoordinates.screenY;
         const safeTop = safeAreaTopRef.current;
+        const safeBottom = safeAreaBottomRef.current;
         const windowScreenTop = windowScreenTopRef.current;
         const toolbarBottomRaw = toolbar ? toolbar.y + toolbar.height : null;
         const toolbarBottomScreen = toolbarBottomRaw === null ? null : toolbarBottomRaw + windowScreenTop;
@@ -392,14 +478,12 @@ export const EditorScreen: React.FC = () => {
           `event=screenY:${Math.round(keyboardTop)},height:${Math.round(event.endCoordinates.height)}`,
           `metricsY=${metricsScreenY === null ? 'null' : Math.round(metricsScreenY)},metricsH=${Math.round(metricsHeight)},window=${Math.round(windowSize.width)}x${Math.round(windowSize.height)},screen=${Math.round(screenSize.width)}x${Math.round(screenSize.height)}`,
           `kav(x,y,w,h)=${fmt(kav)},root=${fmt(root)},scroll=${fmt(scroll)},toolbar=${fmt(toolbar)}`,
-          `safeTop=${Math.round(safeTop)},statusBarHeight=${Math.round(windowScreenTop)},toolbarBottomWindow=${toolbarBottomRaw === null ? 'null' : Math.round(toolbarBottomRaw)},toolbarBottomScreen=${toolbarBottomScreen === null ? 'null' : Math.round(toolbarBottomScreen)},keyboardTop=${Math.round(keyboardTop)},overlapPx=${overlap === null ? 'null' : Math.round(overlap)}`,
+          `safeTop=${Math.round(safeTop)},safeBottom=${Math.round(safeBottom)},statusBarHeight=${Math.round(windowScreenTop)},toolbarBottomWindow=${toolbarBottomRaw === null ? 'null' : Math.round(toolbarBottomRaw)},toolbarBottomScreen=${toolbarBottomScreen === null ? 'null' : Math.round(toolbarBottomScreen)},keyboardTop=${Math.round(keyboardTop)},overlapPx=${overlap === null ? 'null' : Math.round(overlap)}`,
           `offset=${Math.round(keyboardAvoidingOffsetRef.current)},phase=${keyboardPhaseRef.current},baseline=${keyboardBaselineHeightRef.current === null ? 'null' : Math.round(keyboardBaselineHeightRef.current)},currentRoot=${Math.round(keyboardCurrentHeightRef.current)}`,
         ].join('\n');
         debugKeyboardTraceTitleRef.current = 'VIVIDO_COLD_KEYBOARD_TRACE';
-        debugKeyboardTraceVisibleRef.current = true;
         setDebugKeyboardTraceTitle('VIVIDO_COLD_KEYBOARD_TRACE');
         setDebugKeyboardTrace(summary);
-        setDebugKeyboardTraceVisible(true);
       }, 150);
     }));
   }, []);
@@ -636,22 +720,39 @@ export const EditorScreen: React.FC = () => {
 
   const runPendingReveal = useCallback(() => {
     const pending = pendingRevealRef.current;
-    if (!pending || appStateRef.current !== 'active'
-      || manualScrollActiveRef.current
-      || suppressRevealAfterManualScrollRef.current) return;
+    if (!pending) return;
+    if (appStateRef.current !== 'active') {
+      recordRevealDecision('rejected-app-state', appStateRef.current);
+      return;
+    }
+    if (manualScrollActiveRef.current) {
+      recordRevealDecision('rejected-manual-drag');
+      return;
+    }
+    if (suppressRevealAfterManualScrollRef.current) {
+      recordRevealDecision('rejected-manual-suppression');
+      return;
+    }
     const owner = editorInputOwnerRef.current;
     const baseline = keyboardBaselineHeightRef.current;
     const current = keyboardCurrentHeightRef.current;
     const layoutIsResized = baseline !== null && current > 0 && baseline - current > 48;
     const keyboardVisible = layoutIsResized || (typeof Keyboard.metrics === 'function' && Boolean(Keyboard.metrics()?.height)) || Keyboard.isVisible();
     if (pending.kind === 'caret') {
-      if (owner !== 'editor' || keyboardPhaseRef.current !== 'visible' || !editorReadyRef.current) return;
+      if (owner !== 'editor' || keyboardPhaseRef.current !== 'visible' || !editorReadyRef.current) {
+        recordRevealDecision('rejected-caret-gate', `${owner ?? 'none'},${keyboardPhaseRef.current},${editorReadyRef.current ? 1 : 0}`);
+        return;
+      }
     } else if (owner !== 'other' || !tagInputFocusedRef.current || !keyboardVisible) {
+      recordRevealDecision('rejected-tag-gate', `${owner ?? 'none'},${tagInputFocusedRef.current ? 1 : 0},${keyboardVisible ? 1 : 0}`);
       return;
     }
     const viewportHeight = scrollViewportHeightRef.current;
     const contentHeight = scrollContentHeightRef.current;
-    if (viewportHeight <= 0 || contentHeight <= 0) return;
+    if (viewportHeight <= 0 || contentHeight <= 0) {
+      recordRevealDecision('rejected-layout', `${contentHeight},${viewportHeight}`);
+      return;
+    }
     const targetTop = pending.kind === 'caret' && latestCaretRectRef.current
       ? editorAreaTopRef.current + editorHostTopRef.current + latestCaretRectRef.current.top
       : pending.top;
@@ -662,6 +763,7 @@ export const EditorScreen: React.FC = () => {
     const safeTop = scrollOffset + 12;
     const safeBottom = scrollOffset + viewportHeight - 12;
     if (targetTop >= safeTop && targetBottom <= safeBottom) {
+      recordRevealDecision('visible-no-scroll', `${Math.round(targetTop)}..${Math.round(targetBottom)}`);
       pendingRevealRef.current = null;
       lastRevealCommandRef.current = null;
       return;
@@ -670,7 +772,10 @@ export const EditorScreen: React.FC = () => {
       ? targetBottom + 12 - viewportHeight
       : targetTop - 12;
     const maxScroll = Math.max(0, contentHeight - viewportHeight);
-    if (desired > maxScroll + 1) return;
+    if (desired > maxScroll + 1) {
+      recordRevealDecision('rejected-max-scroll', `${Math.round(desired)}>${Math.round(maxScroll)}`);
+      return;
+    }
     const target = Math.max(0, Math.min(maxScroll, desired));
     const previous = lastRevealCommandRef.current;
     if (
@@ -679,15 +784,23 @@ export const EditorScreen: React.FC = () => {
       previous.target === target &&
       previous.contentHeight === contentHeight &&
       previous.viewportHeight === viewportHeight
-    ) return;
+    ) {
+      recordRevealDecision('duplicate-scroll', `${Math.round(target)}`);
+      return;
+    }
     if (Math.abs(target - scrollOffset) < 2) {
+      recordRevealDecision('within-threshold', `${Math.round(target)}~${Math.round(scrollOffset)}`);
       pendingRevealRef.current = null;
       lastRevealCommandRef.current = null;
       return;
     }
     lastRevealCommandRef.current = { kind: pending.kind, target, contentHeight, viewportHeight };
+    recordLifecycleEvent('scrollTo', `trigger=${pending.kind}|target=${Math.round(target)}`);
     editorScrollRef.current?.scrollTo({ y: target, animated: false });
-  }, []);
+    if (pending.kind === 'caret') {
+      pendingRevealRef.current = null;
+    }
+  }, [recordLifecycleEvent, recordRevealDecision]);
 
   const scheduleReveal = useCallback(() => {
     if (caretEnsureFrameRef.current !== null) cancelAnimationFrame(caretEnsureFrameRef.current);
@@ -696,7 +809,6 @@ export const EditorScreen: React.FC = () => {
       runPendingReveal();
     });
   }, [runPendingReveal]);
-
   const queueCaretReveal = useCallback((caret: RichEditorActiveState['caretRect']) => {
     latestCaretRectRef.current = caret;
     if (caret) {
@@ -706,16 +818,39 @@ export const EditorScreen: React.FC = () => {
         || Math.abs(previous.bottom - caret.bottom) > 1;
       lastCaretGeometryRef.current = { top: caret.top, bottom: caret.bottom };
       if (manualScrollActiveRef.current) return;
+      if (inputRevealRequestedRef.current && editorInputOwnerRef.current === 'editor') {
+        // Dirty only records intent. The first subsequent state callback owns
+        // the latest caret geometry used for this single visibility check.
+        inputRevealRequestedRef.current = false;
+        explicitCaretRevealRequestedRef.current = false;
+        suppressRevealAfterManualScrollRef.current = false;
+        pendingRevealRef.current = { kind: 'caret', top: caret.top, bottom: caret.bottom };
+        recordLifecycleEvent('reveal-pending', 'kind=caret|trigger=input-state');
+        lastRevealCommandRef.current = null;
+        scheduleReveal();
+        return;
+      }
+      const hasExplicitInteraction = explicitCaretRevealRequestedRef.current;
+      if (hasExplicitInteraction) {
+        explicitCaretRevealRequestedRef.current = false;
+        suppressRevealAfterManualScrollRef.current = false;
+        pendingRevealRef.current = { kind: 'caret', top: caret.top, bottom: caret.bottom };
+        recordLifecycleEvent('reveal-pending', 'kind=caret|trigger=interaction');
+        lastRevealCommandRef.current = null;
+        scheduleReveal();
+        return;
+      }
       if (suppressRevealAfterManualScrollRef.current && !changed) return;
       suppressRevealAfterManualScrollRef.current = false;
       if (editorInputOwnerRef.current === 'editor') {
         pendingRevealRef.current = { kind: 'caret', top: caret.top, bottom: caret.bottom };
+        recordLifecycleEvent('reveal-pending', 'kind=caret|trigger=state');
       }
     } else if (!caret && pendingRevealRef.current?.kind === 'caret') {
       pendingRevealRef.current = null;
     }
     scheduleReveal();
-  }, [scheduleReveal]);
+  }, [recordLifecycleEvent, scheduleReveal]);
 
   const queueCaretRevealAfterInput = useCallback(() => {
     const caret = latestCaretRectRef.current;
@@ -727,9 +862,10 @@ export const EditorScreen: React.FC = () => {
     inputRevealRequestedRef.current = false;
     suppressRevealAfterManualScrollRef.current = false;
     pendingRevealRef.current = { kind: 'caret', top: caret.top, bottom: caret.bottom };
+    recordLifecycleEvent('reveal-pending', 'kind=caret|trigger=input-after-scroll');
     lastRevealCommandRef.current = null;
     scheduleReveal();
-  }, [scheduleReveal]);
+  }, [recordLifecycleEvent, scheduleReveal]);
 
   const revealTagInput = useCallback(() => {
     const inputBottom = tagInputBottomRef.current;
@@ -737,8 +873,9 @@ export const EditorScreen: React.FC = () => {
     suppressRevealAfterManualScrollRef.current = false;
     const bottom = tagEditorTopRef.current + inputBottom;
     pendingRevealRef.current = { kind: 'tag', top: bottom, bottom };
+    recordLifecycleEvent('reveal-pending', 'kind=tag');
     scheduleReveal();
-  }, [scheduleReveal]);
+  }, [recordLifecycleEvent, scheduleReveal]);
 
   useEffect(() => {
     scheduleReveal();
@@ -957,8 +1094,14 @@ export const EditorScreen: React.FC = () => {
       };
       activeSyncFrame = requestAnimationFrame(syncFrame);
     };
+    const willShowSubscription = Keyboard.addListener('keyboardWillShow', (event) => {
+      recordLifecycleEvent('keyboard-will-show', `screenY=${Math.round(event.endCoordinates.screenY)}|height=${Math.round(event.endCoordinates.height)}`);
+    });
+    const willHideSubscription = Keyboard.addListener('keyboardWillHide', (event) => {
+      recordLifecycleEvent('keyboard-will-hide', `screenY=${Math.round(event.endCoordinates.screenY)}|height=${Math.round(event.endCoordinates.height)}`);
+    });
     const showSubscription = Keyboard.addListener('keyboardDidShow', (event) => {
-      recordLifecycleEvent('keyboard-show');
+      recordLifecycleEvent('keyboard-show', `screenY=${Math.round(event.endCoordinates.screenY)}|height=${Math.round(event.endCoordinates.height)}`);
       scheduleColdKeyboardTrace(event);
       // A lifecycle blur owns the editor while the Activity is not visible;
       // do not let a late show from the old WebView session rewrite state.
@@ -986,7 +1129,7 @@ export const EditorScreen: React.FC = () => {
       }
     });
     const hideSubscription = Keyboard.addListener('keyboardDidHide', (event) => {
-      recordLifecycleEvent('keyboard-hide');
+      recordLifecycleEvent('keyboard-hide', `screenY=${Math.round(event.endCoordinates.screenY)}|height=${Math.round(event.endCoordinates.height)}`);
       keyboardToolbarGenerationRef.current += 1;
       if (keyboardToolbarFrameRef.current !== null) {
         cancelAnimationFrame(keyboardToolbarFrameRef.current);
@@ -1151,6 +1294,8 @@ export const EditorScreen: React.FC = () => {
         cancelAnimationFrame(keyboardToolbarFrameRef.current);
         keyboardToolbarFrameRef.current = null;
       }
+      willShowSubscription.remove();
+      willHideSubscription.remove();
       showSubscription.remove();
       hideSubscription.remove();
       appStateSubscription.remove();
@@ -1770,11 +1915,21 @@ export const EditorScreen: React.FC = () => {
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         keyboardVerticalOffset={keyboardAvoidingOffsetRef.current}
         enabled
+        onLayout={(event) => {
+          const { x, y, width, height } = event.nativeEvent.layout;
+          kavFrameRef.current = { x, y, width, height };
+          recordLifecycleEvent('kav-layout', `${Math.round(width)}x${Math.round(height)}`);
+        }}
       >
         <View
           ref={editorRootRef}
           style={styles.contentContainer}
-          onLayout={(event) => handleEditorRootLayout(event.nativeEvent.layout.height)}
+          onLayout={(event) => {
+            const { x, y, width, height } = event.nativeEvent.layout;
+            editorRootFrameRef.current = { x, y, width, height };
+            recordLifecycleEvent('root-layout', `${Math.round(width)}x${Math.round(height)}`);
+            handleEditorRootLayout(height);
+          }}
         >
           <View style={styles.header}>
             <TouchableOpacity
@@ -1795,6 +1950,15 @@ export const EditorScreen: React.FC = () => {
                 {loading ? '保存中...' : editorReady ? '保存' : '编辑器加载中...'}
               </Text>
             </TouchableOpacity>
+            {__DEV__ && KEYBOARD_TRACE_ENABLED && (
+              <TouchableOpacity
+                accessibilityLabel="打开键盘诊断日志"
+                onPress={openKeyboardTrace}
+                style={styles.keyboardTraceEntry}
+              >
+                <Text style={styles.keyboardTraceEntryText}>Trace</Text>
+              </TouchableOpacity>
+            )}
           </View>
 
           <ScrollView
@@ -1805,14 +1969,19 @@ export const EditorScreen: React.FC = () => {
             showsVerticalScrollIndicator={false}
             scrollEventThrottle={16}
             onLayout={(event) => {
-              scrollViewportHeightRef.current = event.nativeEvent.layout.height;
+              const { x, y, width, height } = event.nativeEvent.layout;
+              scrollFrameRef.current = { x, y, width, height };
+              scrollViewportHeightRef.current = height;
+              recordLifecycleEvent('scroll-layout', `${Math.round(width)}x${Math.round(height)}`);
               scheduleReveal();
             }}
             onContentSizeChange={(_, height) => {
               scrollContentHeightRef.current = height;
+              recordLifecycleEvent('scroll-content', `${Math.round(height)}`);
               scheduleReveal();
             }}
             onScrollBeginDrag={() => {
+              recordLifecycleEvent('scroll-begin-drag');
               manualScrollActiveRef.current = true;
               suppressRevealAfterManualScrollRef.current = true;
               pendingRevealRef.current = null;
@@ -1823,6 +1992,7 @@ export const EditorScreen: React.FC = () => {
               }
             }}
             onScrollEndDrag={() => {
+              recordLifecycleEvent('scroll-end-drag');
               // Keep reveal suppressed until a new caret/focus/keyboard/tag
               // signal arrives. This prevents an old caret from reclaiming a
               // user scroll, including devices without momentum callbacks.
@@ -1830,14 +2000,21 @@ export const EditorScreen: React.FC = () => {
               if (inputRevealRequestedRef.current) queueCaretRevealAfterInput();
             }}
             onMomentumScrollBegin={() => {
+              recordLifecycleEvent('scroll-momentum-begin');
               manualScrollActiveRef.current = true;
             }}
             onMomentumScrollEnd={() => {
+              recordLifecycleEvent('scroll-momentum-end');
               manualScrollActiveRef.current = false;
               if (inputRevealRequestedRef.current) queueCaretRevealAfterInput();
             }}
             onScroll={(event) => {
-              scrollOffsetRef.current = event.nativeEvent.contentOffset.y;
+              const nextOffset = event.nativeEvent.contentOffset.y;
+              if (Math.abs(nextOffset - lastLoggedScrollOffsetRef.current) >= 4) {
+                recordLifecycleEvent('scroll-offset', `${Math.round(lastLoggedScrollOffsetRef.current)}->${Math.round(nextOffset)}`);
+                lastLoggedScrollOffsetRef.current = nextOffset;
+              }
+              scrollOffsetRef.current = nextOffset;
               if (!manualScrollActiveRef.current && !suppressRevealAfterManualScrollRef.current) {
                 scheduleReveal();
               }
@@ -1892,27 +2069,32 @@ export const EditorScreen: React.FC = () => {
                     initialMarkup={content}
                     showToolbar={false}
                     onStateChange={(state) => {
+                      recordLifecycleEvent('state', `focus=${state.isFocused ? 1 : 0}|caret=${state.caretRect ? `${Math.round(state.caretRect.top)}..${Math.round(state.caretRect.bottom)}` : 'null'}`);
                       setEditorActiveState(state);
-                      queueCaretReveal(state.caretRect);
                       // A delayed false snapshot can follow the native/WebView
                       // touch event. Only a positive editor snapshot may claim
                       // ownership; title/tag focus explicitly revokes it.
                       if (state.isFocused && editorInputOwnerRef.current !== 'other') {
                         handleEditorFocusChange(true);
                       }
+                      queueCaretReveal(state.caretRect);
                     }}
                     onFocusChange={handleEditorFocusChange}
+                    onInteraction={() => {
+                      explicitCaretRevealRequestedRef.current = true;
+                    }}
                     onReady={(adapter) => {
                       editorRef.current = adapter;
                       const state = adapter.getActiveState();
                       setEditorActiveState(state);
-                      queueCaretReveal(state.caretRect);
                       if (state.isFocused) handleEditorFocusChange(true);
+                      queueCaretReveal(state.caretRect);
                       setEditorLoadError(null);
                       setEditorReady(true);
                     }}
                     onDirty={() => {
-                      queueCaretRevealAfterInput();
+                      inputRevealRequestedRef.current = true;
+                      recordLifecycleEvent('dirty');
                       if (!editorDirtyRef.current) {
                         editorDirtyRef.current = true;
                         setHasUnsavedChanges(true);
@@ -2004,6 +2186,13 @@ export const EditorScreen: React.FC = () => {
               style={styles.keyboardToolbar}
               onLayout={(event) => {
                 const height = event.nativeEvent.layout.height;
+                toolbarFrameRef.current = {
+                  x: event.nativeEvent.layout.x,
+                  y: event.nativeEvent.layout.y,
+                  width: event.nativeEvent.layout.width,
+                  height,
+                };
+                recordLifecycleEvent('toolbar-layout', `${Math.round(event.nativeEvent.layout.width)}x${Math.round(height)}`);
                 if (height !== keyboardToolbarHeightRef.current) {
                   keyboardToolbarHeightRef.current = height;
                   scheduleReveal();
@@ -2016,31 +2205,61 @@ export const EditorScreen: React.FC = () => {
         </View>
       </KeyboardAvoidingView>
 
-      {__DEV__ && KEYBOARD_TRACE_ENABLED && debugKeyboardTraceVisible && debugKeyboardTrace && (
-        <View pointerEvents="box-none" style={styles.keyboardTraceOverlay}>
-          <View style={styles.keyboardTraceCard}>
-            <View style={styles.keyboardTraceHeader}>
-              <Text style={styles.keyboardTraceTitle}>{debugKeyboardTraceTitle}</Text>
-              <TouchableOpacity
-                accessibilityLabel="关闭键盘诊断"
-                onPress={() => {
-                  debugKeyboardTraceVisibleRef.current = false;
-                  setDebugKeyboardTraceVisible(false);
-                }}
-                style={styles.keyboardTraceClose}
+      {__DEV__ && KEYBOARD_TRACE_ENABLED && (
+        <Modal
+          visible={debugKeyboardTraceVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => {
+            debugKeyboardTraceVisibleRef.current = false;
+            setDebugKeyboardTraceVisible(false);
+          }}
+        >
+          <View style={styles.keyboardTraceModalBackdrop}>
+            <View style={styles.keyboardTraceCard}>
+              <View style={styles.keyboardTraceHeader}>
+                <Text style={styles.keyboardTraceTitle}>{debugKeyboardTraceTitle}</Text>
+                <TouchableOpacity
+                  accessibilityLabel="关闭键盘诊断"
+                  onPress={() => {
+                    debugKeyboardTraceVisibleRef.current = false;
+                    setDebugKeyboardTraceVisible(false);
+                  }}
+                  style={styles.keyboardTraceClose}
+                >
+                  <Text style={styles.keyboardTraceCloseText}>关闭</Text>
+                </TouchableOpacity>
+              </View>
+              <ScrollView
+                style={styles.keyboardTraceScroll}
+                nestedScrollEnabled
+                showsVerticalScrollIndicator
               >
-                <Text style={styles.keyboardTraceCloseText}>关闭</Text>
-              </TouchableOpacity>
+                <Text selectable style={styles.keyboardTraceText}>{debugKeyboardTrace ?? getDebugTraceSnapshot(false)}</Text>
+              </ScrollView>
+              {debugKeyboardTraceError && (
+                <Text style={styles.keyboardTraceError}>{debugKeyboardTraceError}</Text>
+              )}
+              <View style={styles.keyboardTraceActions}>
+                <TouchableOpacity onPress={clearKeyboardTrace} style={styles.keyboardTraceAction}>
+                  <Text style={styles.keyboardTraceActionText}>清空</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={shareKeyboardTrace} style={styles.keyboardTraceAction}>
+                  <Text style={styles.keyboardTraceActionText}>分享</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => {
+                    debugKeyboardTraceVisibleRef.current = false;
+                    setDebugKeyboardTraceVisible(false);
+                  }}
+                  style={styles.keyboardTraceAction}
+                >
+                  <Text style={styles.keyboardTraceActionText}>关闭</Text>
+                </TouchableOpacity>
+              </View>
             </View>
-            <ScrollView
-              style={styles.keyboardTraceScroll}
-              nestedScrollEnabled
-              showsVerticalScrollIndicator
-            >
-              <Text selectable style={styles.keyboardTraceText}>{debugKeyboardTrace}</Text>
-            </ScrollView>
           </View>
-        </View>
+        </Modal>
       )}
 
       {/* Draft restore dialog */}
@@ -2202,6 +2421,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    position: 'relative',
     paddingHorizontal: 16,
     paddingVertical: 12,
     backgroundColor: PAPER_BG,
@@ -2358,14 +2578,27 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: 'rgba(196, 112, 48, 0.12)',
   },
-  keyboardTraceOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    zIndex: 50,
-    elevation: 50,
-    paddingTop: 6,
+  keyboardTraceEntry: {
+    position: 'absolute',
+    right: 68,
+    top: 8,
+    minWidth: 50,
+    alignItems: 'flex-end',
+    paddingVertical: 4,
+  },
+  keyboardTraceEntryText: {
+    color: BRAND_GOLD,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  keyboardTraceModalBackdrop: {
+    flex: 1,
+    justifyContent: 'center',
     paddingHorizontal: 12,
+    backgroundColor: 'rgba(0, 0, 0, 0.28)',
   },
   keyboardTraceCard: {
+    height: '52%',
     maxHeight: '52%',
     backgroundColor: 'rgba(35, 27, 22, 0.94)',
     borderRadius: 8,
@@ -2394,6 +2627,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   keyboardTraceScroll: {
+    flex: 1,
     paddingHorizontal: 10,
     paddingVertical: 8,
   },
@@ -2402,5 +2636,26 @@ const styles = StyleSheet.create({
     fontSize: 10,
     lineHeight: 15,
     fontFamily: 'monospace',
+  },
+  keyboardTraceError: {
+    color: '#ffb4a8',
+    fontSize: 11,
+    paddingHorizontal: 10,
+    paddingBottom: 6,
+  },
+  keyboardTraceActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.18)',
+  },
+  keyboardTraceAction: {
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+  keyboardTraceActionText: {
+    color: '#ffd7a8',
+    fontSize: 12,
+    fontWeight: '600',
   },
 });
