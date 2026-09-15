@@ -237,6 +237,9 @@ export const EditorScreen: React.FC = () => {
   const scrollContentHeightRef = useRef(0);
   const pendingRevealRef = useRef<PendingReveal | null>(null);
   const manualScrollActiveRef = useRef(false);
+  const inputCaretObservedDuringManualRef = useRef(false);
+  const postDragIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const manualScrollLastOffsetRef = useRef(0);
   const suppressRevealAfterManualScrollRef = useRef(false);
   const lastCaretGeometryRef = useRef<{ top: number; bottom: number } | null>(null);
   const inputRevealRequestedRef = useRef(false);
@@ -837,7 +840,14 @@ export const EditorScreen: React.FC = () => {
         || Math.abs(previous.top - caret.top) > 1
         || Math.abs(previous.bottom - caret.bottom) > 1;
       lastCaretGeometryRef.current = { top: caret.top, bottom: caret.bottom };
-      if (manualScrollActiveRef.current) return;
+      if (manualScrollActiveRef.current) {
+        if (inputRevealRequestedRef.current) {
+          // This is the fresh state for the current dirty transaction; defer
+          // its one reveal until drag/momentum has actually ended.
+          inputCaretObservedDuringManualRef.current = true;
+        }
+        return;
+      }
       if (inputRevealRequestedRef.current && editorInputOwnerRef.current === 'editor') {
         // Dirty only records intent. The first subsequent state callback owns
         // the latest caret geometry used for this single visibility check.
@@ -886,6 +896,31 @@ export const EditorScreen: React.FC = () => {
     lastRevealCommandRef.current = null;
     scheduleReveal();
   }, [recordLifecycleEvent, scheduleReveal]);
+
+  const cancelPostDragIdleTimer = useCallback(() => {
+    if (postDragIdleTimerRef.current !== null) {
+      clearTimeout(postDragIdleTimerRef.current);
+      postDragIdleTimerRef.current = null;
+    }
+  }, []);
+
+  const finishPostDragIdle = useCallback(() => {
+    cancelPostDragIdleTimer();
+    manualScrollActiveRef.current = false;
+    if (inputCaretObservedDuringManualRef.current) {
+      queueCaretRevealAfterInput();
+    }
+    inputCaretObservedDuringManualRef.current = false;
+  }, [cancelPostDragIdleTimer, queueCaretRevealAfterInput]);
+
+  const restartPostDragIdleTimer = useCallback(() => {
+    cancelPostDragIdleTimer();
+    postDragIdleTimerRef.current = setTimeout(finishPostDragIdle, 150);
+  }, [cancelPostDragIdleTimer, finishPostDragIdle]);
+
+  useEffect(() => () => {
+    cancelPostDragIdleTimer();
+  }, [cancelPostDragIdleTimer]);
 
   const revealTagInput = useCallback(() => {
     const inputBottom = tagInputBottomRef.current;
@@ -2016,7 +2051,10 @@ export const EditorScreen: React.FC = () => {
             }}
             onScrollBeginDrag={() => {
               recordLifecycleEvent('scroll-begin-drag');
+              cancelPostDragIdleTimer();
+              inputCaretObservedDuringManualRef.current = false;
               manualScrollActiveRef.current = true;
+              manualScrollLastOffsetRef.current = scrollOffsetRef.current;
               suppressRevealAfterManualScrollRef.current = true;
               pendingRevealRef.current = null;
               lastRevealCommandRef.current = null;
@@ -2027,20 +2065,20 @@ export const EditorScreen: React.FC = () => {
             }}
             onScrollEndDrag={() => {
               recordLifecycleEvent('scroll-end-drag');
-              // Keep reveal suppressed until a new caret/focus/keyboard/tag
-              // signal arrives. This prevents an old caret from reclaiming a
-              // user scroll, including devices without momentum callbacks.
-              manualScrollActiveRef.current = false;
-              if (inputRevealRequestedRef.current) queueCaretRevealAfterInput();
+              // Momentum begin may be dispatched after end-drag. Keep manual
+              // arbitration active and release only after an idle interval.
+              manualScrollActiveRef.current = true;
+              manualScrollLastOffsetRef.current = scrollOffsetRef.current;
+              restartPostDragIdleTimer();
             }}
             onMomentumScrollBegin={() => {
               recordLifecycleEvent('scroll-momentum-begin');
               manualScrollActiveRef.current = true;
+              if (postDragIdleTimerRef.current === null) restartPostDragIdleTimer();
             }}
             onMomentumScrollEnd={() => {
               recordLifecycleEvent('scroll-momentum-end');
-              manualScrollActiveRef.current = false;
-              if (inputRevealRequestedRef.current) queueCaretRevealAfterInput();
+              finishPostDragIdle();
             }}
             onScroll={(event) => {
               const nextOffset = event.nativeEvent.contentOffset.y;
@@ -2049,6 +2087,13 @@ export const EditorScreen: React.FC = () => {
                 lastLoggedScrollOffsetRef.current = nextOffset;
               }
               scrollOffsetRef.current = nextOffset;
+              if (
+                manualScrollActiveRef.current
+                && Math.abs(nextOffset - manualScrollLastOffsetRef.current) > 0.5
+              ) {
+                manualScrollLastOffsetRef.current = nextOffset;
+                if (postDragIdleTimerRef.current !== null) restartPostDragIdleTimer();
+              }
               if (!manualScrollActiveRef.current && !suppressRevealAfterManualScrollRef.current) {
                 scheduleReveal();
               }
@@ -2127,6 +2172,7 @@ export const EditorScreen: React.FC = () => {
                       setEditorReady(true);
                     }}
                     onDirty={() => {
+                      inputCaretObservedDuringManualRef.current = false;
                       inputRevealRequestedRef.current = true;
                       recordLifecycleEvent('dirty');
                       if (!editorDirtyRef.current) {
