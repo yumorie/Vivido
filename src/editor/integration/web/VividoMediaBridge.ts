@@ -1,5 +1,6 @@
-import { Node, mergeAttributes } from '@tiptap/core';
+import { Extension, Node, mergeAttributes } from '@tiptap/core';
 import type { Editor } from '@tiptap/core';
+import { Plugin } from '@tiptap/pm/state';
 import { BridgeExtension } from '@10play/tentap-editor/web';
 import type {
   VividoMediaAction,
@@ -103,6 +104,21 @@ const createMediaNode = (mediaType: VividoMediaType) =>
 const imageNode = createMediaNode('image');
 const audioNode = createMediaNode('audio');
 const videoNode = createMediaNode('video');
+
+// The RN ScrollView owns vertical scrolling; prevent ProseMirror's default
+// scrollRectIntoView/window.scrollBy path from competing with it.
+const vividoOuterScrollOwner = Extension.create({
+  name: 'vividoOuterScrollOwner',
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        props: {
+          handleScrollToSelection: () => true,
+        },
+      }),
+    ];
+  },
+});
 
 const previewUriPattern = /^(?:file|content):\/\//i;
 let previewCache: VividoMediaPreview[] = [];
@@ -303,7 +319,7 @@ const vividoMediaBridge = new BridgeExtension<
 >({
   forceName: VIVIDO_MEDIA_BRIDGE_NAME,
   tiptapExtension: imageNode,
-  tiptapExtensionDeps: [audioNode, videoNode],
+  tiptapExtensionDeps: [audioNode, videoNode, vividoOuterScrollOwner],
   onBridgeMessage: (editor, message) => {
     if (message.type === 'insert-media') {
       return insertMedia(editor, message.payload.mediaType, message.payload.mediaId);
