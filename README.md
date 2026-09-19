@@ -72,6 +72,16 @@ If you're on a different network, use tunnel mode:
 npm run start:tunnel
 ```
 
+## Testing Tunnel
+
+Need Android app "Expo Go"
+
+```bash
+$env:HTTP_PROXY='http://127.0.0.1:7890'; $env:HTTPS_PROXY='http://127.0.0.1:7890'; $env:ALL_PROXY='http://127.0.0.1:7890'; npx.cmd expo start --go --tunnel
+```
+
+Run command, then use Expo Go app to scanning QR or requesting the URL which is start with "exp://"
+
 ## Building
 
 ### Android
